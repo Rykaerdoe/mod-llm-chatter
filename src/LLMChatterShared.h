@@ -64,10 +64,15 @@ void SendBotTextEmote(Player* bot, uint32 textEmoteId,
                       const std::string& targetName);
 
 std::string GetTextEmoteName(uint32 emoteId);
+// logForTts: set false only when the caller already logged this message
+// elsewhere (e.g. queued llm_chatter_messages deliveries that reuse this
+// function for raid-subgroup broadcast) - true by default so every
+// genuine instant-path combat/state call site needs no changes at all.
 void SendPartyMessageInstant(
     Player* bot, Group* group,
     const std::string& message,
-    const std::string& emote);
+    const std::string& emote,
+    bool logForTts = true);
 void RecordPartyChatGateActivity(
     uint32 groupId,
     const std::string& deliveryPolicy,

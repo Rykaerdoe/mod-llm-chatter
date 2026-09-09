@@ -2414,7 +2414,8 @@ void SendBotTextEmote(Player* bot, uint32 textEmoteId,
 void SendPartyMessageInstant(
     Player* bot, Group* group,
     const std::string& message,
-    const std::string& emote)
+    const std::string& emote,
+    bool logForTts)
 {
     WorldPacket data;
     ChatHandler::BuildChatPacket(
@@ -2431,6 +2432,31 @@ void SendPartyMessageInstant(
         subGroup = group->GetMemberGroup(bot->GetGUID());
 
     group->BroadcastPacket(&data, false, subGroup);
+
+    // Instant-path combat/state lines (kill reactions, low health/OOM
+    // callouts, spell cast reactions, farewells) are pre-cached/templated
+    // and bypass llm_chatter_messages entirely - there's no LLM
+    // round-trip to queue, so external tools polling that table (e.g. a
+    // text-to-speech bridge) never see them. Log spoken text only (never
+    // emotes, per design - a bare emote token isn't meant to be read
+    // aloud) to a dedicated table so anything wanting "every party line"
+    // has one place to read from instead of also having to intercept
+    // every instant-path call site individually.
+    // logForTts=false is used by the one call site (queued raid-group
+    // delivery in LLMChatterDelivery.cpp) that already gets logged via
+    // llm_chatter_messages itself - without the flag, that path would be
+    // logged twice and get spoken aloud twice.
+    if (logForTts && !message.empty())
+    {
+        CharacterDatabase.Execute(
+            "INSERT INTO llm_chatter_instant_log "
+            "(bot_guid, bot_name, group_id, message) "
+            "VALUES ({}, '{}', {}, '{}')",
+            bot->GetGUID().GetCounter(),
+            EscapeString(bot->GetName()),
+            group->GetGUID().GetCounter(),
+            EscapeString(message));
+    }
 
     if (!emote.empty())
     {

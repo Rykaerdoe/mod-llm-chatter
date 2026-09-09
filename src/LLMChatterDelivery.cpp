@@ -484,9 +484,15 @@ void DeliverPendingMessagesImpl()
                 Group* grp = bot->GetGroup();
                 if (grp && grp->isRaidGroup())
                 {
+                    // logForTts=false: this is a queued delivery
+                    // (already came from llm_chatter_messages, just
+                    // reusing this function's packet-building for the
+                    // raid-subgroup case) - it's already visible to
+                    // anything polling that table, so logging it again
+                    // here would get it spoken twice.
                     SendPartyMessageInstant(
                         bot, grp, processedMessage,
-                        "");
+                        "", false);
                     sent = true;
                 }
                 else
