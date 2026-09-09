@@ -11,7 +11,6 @@ bot selection by zone.
 
 import logging
 import random
-import time
 
 # Module-level config defaults (set by init_general_config)
 _chat_history_limit = 10
@@ -28,13 +27,11 @@ from chatter_shared import (
     find_addressed_bot,
     insert_chat_message,
     build_anti_repetition_context,
-    build_bot_identity_with_level,
     get_recent_zone_messages,
     append_json_instruction,
     parse_single_response,
     should_include_action,
-    _zone_delivery_delay,
-    _zone_last_delivery,
+    _extend_zone_delivery_window,
     get_zone_flavor,
     get_zone_name,
     get_player_zone,
@@ -47,6 +44,10 @@ from chatter_prompts import (
     maybe_get_creative_twist,
     build_environmental_context_lines,
     pick_personality_spices,
+)
+from chatter_mode import (
+    build_player_chat_guidance,
+    build_player_identity,
 )
 from chatter_constants import (
     PERSONALITY_TRAITS,
@@ -390,23 +391,22 @@ def _build_general_response_prompt(
             "grounded. Don't break character."
         )
     else:
-        style = (
-            "Reply as a regular WoW player in "
-            "General chat — could be any age, "
-            "mature and grounded. Talk about the "
-            "game naturally, as a player not a "
-            "character. Reference zones, classes, "
-            "abilities, and creatures by name."
+        style = build_player_chat_guidance(
+            mode, 'general'
         )
 
-    env_lines = build_environmental_context_lines()
+    env_lines = (
+        build_environmental_context_lines()
+        if is_rp else []
+    )
 
-    identity = build_bot_identity_with_level(
+    identity = build_player_identity(
         bot_name,
         bot_race,
         bot_class,
         bot_level,
-        gender=bot_gender,
+        bot_gender,
+        mode,
     )
     prompt = (
         f"{identity}\n"
@@ -430,7 +430,7 @@ def _build_general_response_prompt(
     )
 
     prompt += (
-        f"You are in {zone_name}."
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
     )
     if env_lines:
         prompt += "\n" + "\n".join(env_lines)
@@ -543,13 +543,8 @@ def _build_general_followup_prompt(
             "grounded."
         )
     else:
-        style = (
-            "Reply as a regular WoW player in "
-            "General chat — could be any age, "
-            "mature and grounded. Talk about the "
-            "game naturally, as a player not a "
-            "character. Reference zones, classes, "
-            "abilities, and creatures by name."
+        style = build_player_chat_guidance(
+            mode, 'general'
         )
 
     # 40% chance to address someone by name
@@ -563,12 +558,13 @@ def _build_general_followup_prompt(
             f"name in your reply\n"
         )
 
-    identity = build_bot_identity_with_level(
+    identity = build_player_identity(
         bot_name,
         bot_race,
         bot_class,
         bot_level,
-        gender=bot_gender,
+        bot_gender,
+        mode,
     )
     prompt = (
         f"{identity}\n"
@@ -581,7 +577,7 @@ def _build_general_followup_prompt(
     prompt += (
         f"Your tone: {tone}\n"
         f"Your mood: {mood}\n"
-        f"You are in {zone_name}."
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
     )
     if is_rp and zone_flavor:
         prompt += f"\nZone context: {zone_flavor}"
@@ -1105,11 +1101,10 @@ def _general_followup(
         source_delay_seconds=delay2,
     )
 
-    # Push zone timestamp past bot2's delivery so
-    # the gap enforced from the END of the exchange.
-    _zone_last_delivery[zone_id] = (
-        time.monotonic() + delay2
-    )
+    # Keep later automated chatter behind this
+    # player-driven exchange without shortening an
+    # existing reservation from another producer.
+    _extend_zone_delivery_window(zone_id, delay2)
 
     # Store in General chat history
     _store_general_chat(
@@ -1175,13 +1170,8 @@ def _build_general_continuation_prompt(
             "grounded."
         )
     else:
-        style = (
-            "Reply as a regular WoW player in "
-            "General chat — could be any age, "
-            "mature and grounded. Talk about the "
-            "game naturally, as a player not a "
-            "character. Reference zones, classes, "
-            "abilities, and creatures by name."
+        style = build_player_chat_guidance(
+            mode, 'general'
         )
 
     # Format the conversation thread
@@ -1207,12 +1197,13 @@ def _build_general_continuation_prompt(
             f"name in your reply\n"
         )
 
-    identity = build_bot_identity_with_level(
+    identity = build_player_identity(
         bot_name,
         bot_race,
         bot_class,
         bot_level,
-        gender=bot_gender,
+        bot_gender,
+        mode,
     )
     prompt = (
         f"{identity}\n"
@@ -1225,7 +1216,7 @@ def _build_general_continuation_prompt(
     prompt += (
         f"Your tone: {tone}\n"
         f"Your mood: {mood}\n"
-        f"You are in {zone_name}."
+        f"{'You are' if is_rp else 'Your character is'} in {zone_name}."
     )
     if is_rp and zone_flavor:
         prompt += f"\nZone context: {zone_flavor}"
@@ -1529,6 +1520,9 @@ def _general_extended_conversation(
             delay_seconds=current_delay,
             event_id=event_id,
             sequence=msg_count - 1,
+        )
+        _extend_zone_delivery_window(
+            zone_id, current_delay
         )
         maybe_queue_group_general_reaction(
             db, config,

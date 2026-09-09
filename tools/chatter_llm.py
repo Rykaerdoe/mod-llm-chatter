@@ -45,6 +45,26 @@ def _build_chat_messages(sys_msg, user_content):
     return messages
 
 
+def _build_anthropic_request_kwargs(
+    model, max_tokens, temperature, sys_msg, user_msg
+):
+    """Build Anthropic SDK v1-compatible request arguments."""
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{
+            "role": "user",
+            "content": user_msg,
+        }],
+        "extra_body": {
+            "temperature": temperature,
+        },
+    }
+    if sys_msg:
+        kwargs["system"] = sys_msg
+    return kwargs
+
+
 def _openrouter_headers(config):
     """Build optional OpenRouter app-attribution headers."""
     headers = {}
@@ -59,6 +79,40 @@ def _openrouter_headers(config):
     if title:
         headers['X-OpenRouter-Title'] = title
     return headers or None
+
+
+def _openrouter_reasoning_effort(config):
+    """Return the configured OpenRouter reasoning effort."""
+    effort = str(config.get(
+        'LLMChatter.OpenRouter.ReasoningEffort', ''
+    )).strip()
+    return effort or None
+
+
+def _openrouter_reasoning_enabled(config):
+    """Return whether OpenRouter reasoning needs extra output budget."""
+    effort = _openrouter_reasoning_effort(config)
+    return bool(effort) and effort.lower() != 'none'
+
+
+def _apply_openrouter_options(kwargs, config):
+    """Attach opt-in OpenRouter reasoning request options."""
+    effort = _openrouter_reasoning_effort(config)
+    if not effort:
+        return
+
+    # Unlike Google, "none" is sent explicitly so hybrid models are
+    # forced into their non-reasoning mode instead of using defaults.
+    # Normalize only the "none" sentinel; other values keep their
+    # configured case since supported effort spellings vary by model.
+    if effort.lower() == 'none':
+        effort = 'none'
+    reasoning = {'effort': effort}
+    if str(config.get(
+        'LLMChatter.OpenRouter.ReasoningExclude', '0'
+    )).strip() == '1':
+        reasoning['exclude'] = True
+    kwargs['extra_body'] = {'reasoning': reasoning}
 
 
 def _ollama_user_msg(user_msg, config):
@@ -124,14 +178,26 @@ def _apply_google_options(kwargs, config):
 
 def _effective_max_tokens(provider, config, max_tokens):
     """Adjust provider-specific output budget."""
-    if provider != 'google':
+    if provider == 'google':
+        config_key = 'LLMChatter.Google.MaxTokensMultiplier'
+        default_multiplier = 2
+    elif (
+        provider == 'openrouter'
+        and _openrouter_reasoning_enabled(config)
+    ):
+        config_key = (
+            'LLMChatter.OpenRouter.MaxTokensMultiplier'
+        )
+        default_multiplier = 1
+    else:
         return max_tokens
+
     try:
         multiplier = float(config.get(
-            'LLMChatter.Google.MaxTokensMultiplier', 2
+            config_key, default_multiplier
         ))
     except (TypeError, ValueError):
-        multiplier = 2.0
+        multiplier = float(default_multiplier)
     multiplier = max(1.0, min(multiplier, 8.0))
     return int(max_tokens * multiplier)
 
@@ -353,6 +419,8 @@ def call_llm(
             }
             if provider == 'google':
                 _apply_google_options(kwargs, config)
+            elif provider == 'openrouter':
+                _apply_openrouter_options(kwargs, config)
             response = client.chat.completions.create(
                 **kwargs
             )
@@ -361,17 +429,13 @@ def call_llm(
             )
         else:
             # Anthropic (default)
-            kwargs = {
-                "model": model,
-                "max_tokens": request_max_tokens,
-                "temperature": temperature,
-                "messages": [{
-                    "role": "user",
-                    "content": user_msg,
-                }],
-            }
-            if sys_msg:
-                kwargs["system"] = sys_msg
+            kwargs = _build_anthropic_request_kwargs(
+                model,
+                request_max_tokens,
+                temperature,
+                sys_msg,
+                user_msg,
+            )
             response = client.messages.create(
                 **kwargs
             )
@@ -630,6 +694,8 @@ def quick_llm_analyze(
             }
             if provider == 'google':
                 _apply_google_options(kwargs, config)
+            elif provider == 'openrouter':
+                _apply_openrouter_options(kwargs, config)
             response = (
                 active_client
                 .chat.completions.create(
@@ -640,17 +706,13 @@ def quick_llm_analyze(
                 response, label
             )
         else:
-            kwargs = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "temperature": 0.1,
-                "messages": [{
-                    "role": "user",
-                    "content": user_msg,
-                }],
-            }
-            if sys_msg:
-                kwargs["system"] = sys_msg
+            kwargs = _build_anthropic_request_kwargs(
+                model,
+                max_tokens,
+                0.1,
+                sys_msg,
+                user_msg,
+            )
             response = (
                 active_client.messages.create(
                     **kwargs

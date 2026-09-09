@@ -588,6 +588,25 @@ LLMChatter.Model = openai/gpt-4o-mini
 LLMChatter.OpenRouter.ApiKey = sk-or-v1-xxxxx
 ```
 
+Reasoning is opt-in for OpenRouter. An empty effort preserves the
+provider/model defaults; `none` explicitly disables reasoning on hybrid
+models. Higher efforts share the response token budget with visible
+output, so increase the multiplier when responses become empty or
+truncated:
+
+```ini
+LLMChatter.Provider = openrouter
+LLMChatter.Model = deepseek/deepseek-v4-flash
+LLMChatter.OpenRouter.ReasoningEffort = high
+LLMChatter.OpenRouter.ReasoningExclude = 1
+LLMChatter.OpenRouter.MaxTokensMultiplier = 5
+```
+
+`ReasoningExclude` hides reasoning text returned by OpenRouter but does
+not reduce reasoning-token usage or cost. The multiplier is ignored
+when the effort is empty or `none`. OpenRouter effort values are passed
+through without client-side validation because support varies by model.
+
 ```ini
 LLMChatter.Provider = ollama
 LLMChatter.Model = qwen3:4b
@@ -606,13 +625,15 @@ system message and a user message.
 Provider behavior:
 
 - **Anthropic**: system content passed via the `system=` parameter
-  on the API call (native system prompt support)
+  on the API call (native system prompt support); sampling temperature
+  is sent through `extra_body` for Anthropic SDK v1 compatibility
 - **OpenAI**: system content sent as a `{"role": "system", ...}`
   message prepended to the messages array
 - **Google Gemini**: uses Google's OpenAI-compatible chat-completions
   endpoint, so system content is sent as a system role message
 - **OpenRouter**: uses OpenRouter's OpenAI-compatible
-  chat-completions endpoint with optional attribution headers
+  chat-completions endpoint with optional attribution headers and an
+  opt-in `reasoning` object for normal and quick-analysis requests
 - **Ollama**: same as OpenAI (system role message)
 
 When a plain string is passed to `call_llm()` instead of
@@ -627,6 +648,7 @@ When a plain string is passed to `call_llm()` instead of
 | `_build_chat_messages()` | Assembles the provider-specific messages array |
 | `_ollama_user_msg()` | Formats the user message for Ollama's chat API |
 | `_apply_google_options()` | Applies Gemini reasoning/thinking settings for OpenAI compatibility |
+| `_apply_openrouter_options()` | Applies opt-in OpenRouter reasoning settings |
 | `_openrouter_headers()` | Builds optional OpenRouter attribution headers |
 
 ---
@@ -639,11 +661,31 @@ Configured through:
 
 Modes:
 
-- `normal`: casual MMO-style chat
+- `normal`: playerbots speak as people playing WoW
 - `roleplay`: in-character, race/class-influenced chat
 
-The Python prompt builders are mode-aware and choose different tone,
-mood, and style guidance based on the configured mode.
+The Python prompt builders use `chatter_mode.py` as the canonical voice
+contract. Normal mode applies to playerbot speech in General, Party,
+Guild, Battleground, Raid, screenshot reactions, emote reactions, and
+playerbot proximity `/say`. It has a friendly and respectful baseline,
+allows polite, quiet, dry, playful, blunt, or occasionally mildly salty
+players, and avoids making toxicity or forced gamer slang the default.
+
+Normal prompts treat race, class, level, health, travel, weather, and
+locations as character or game state rather than sensations physically
+experienced by the speaker. Character backstories and race/class
+worldview material are prompt inputs only in roleplay mode. Memory
+callbacks in normal mode are framed as remembered gameplay events.
+
+Actual NPCs are the exception: they always remain lore-friendly,
+in-world speakers. Proximity chatter can contain NPCs and playerbots in
+the same scene, so `chatter_proximity.py` applies the voice rule per
+speaker using the existing `is_npc` payload field.
+
+Changing `LLMChatter.ChatterMode` requires a bridge restart. Because
+`llm_group_cached_responses` has no mode column, bridge startup removes
+only `ready` pre-cache rows and then refills them under the active mode;
+used and expired history is left to normal cache hygiene.
 
 ---
 
@@ -742,6 +784,17 @@ That path:
 - selects responding bot(s)
 - builds the player-reaction prompt
 - dispatches the reaction through the bridge path
+
+### Shared zone pacing
+
+Automated ambient and world-event General producers share one per-zone
+delivery reservation. Multi-line conversations reserve the complete
+scheduled sequence before inserting their first row, and the next
+automated sequence waits for `GeneralChat.MinZoneGap` after the prior
+one's final line. This serializes independently generated ambient,
+transport, weather, holiday, and minor-event chatter without reducing
+their trigger chances. Direct replies to a player's General message stay
+responsive and can interrupt that automated timeline.
 
 ### Relevant files
 
@@ -1134,8 +1187,13 @@ more socially dynamic.
 Known playerbot control commands are not supposed to reach this
 conversation path in current source:
 
-- C++ now blocks them before creating `bot_group_player_msg` events
+- C++ blocks them before creating `bot_group_player_msg` events,
+  including known commands following a valid Playerbot `@target`
+  selector and `@command` shorthand
 - Python keeps `_is_playerbot_command()` as a fallback skip layer
+- ordinary `@BotName` conversation and non-command text after a simple
+  selector are preserved; valid aura and aggro selectors are always
+  treated as unconditional Playerbot control traffic
 
 ### Trigger logic
 
@@ -1826,7 +1884,7 @@ from the resulting description.
 2. Resolves zone/subzone context via existing `get_zone_name()`,
    `get_zone_flavor()`, `get_subzone_name()`, `get_subzone_lore()`,
    `get_dungeon_flavor()`, `get_time_of_day_context()`
-3. Builds bot identity via `build_bot_identity(name, race, class, gender)`
+3. Builds the playerbot identity and voice via `chatter_mode.py`
 4. Adds live travel context when present. This lets the LLM use taxi
    flight, flying mount, ground mount, swimming, or world-transport
    context while avoiding impossible ground actions.
@@ -1834,6 +1892,12 @@ from the resulting description.
    conversation (`append_conversation_json_instruction()` +
    `parse_conversation_response()`)
 6. Writes messages to `llm_chatter_messages` for C++ delivery
+
+Roleplay mode treats the vision description as what the character sees
+in-world and excludes UI/game-mechanic commentary. Normal mode treats it
+as a description of the game screenshot, allows supplied world or UI
+details to be discussed without inventing them, and responds in player
+voice rather than claiming physical presence in the scene.
 
 ### Config keys
 
@@ -1880,60 +1944,131 @@ All under `LLMChatter.Screenshot.*`:
 ## 13q. Proximity Chatter
 
 Bots and NPCs can engage in ambient `/say` conversations as the player
-moves through the world. Unlike General-channel chatter (zone-wide) or
+moves through outdoor maps, dungeons, and raids. Unlike General-channel
+chatter (zone-wide) or
 party chat (group-scoped), proximity chatter is spatially local — only
 players and bots within `/say` range (~40 yards) see it.
 
 ### Scan and trigger
 
-C++ `CheckProximityChatter()` runs on a configurable timer (default
-30s) in `LLMChatterWorld.cpp`, delegating to
-`LLMChatterProximity.cpp`:
+C++ `CheckProximityChatter(bool instanceMaps)` runs on independent
+outdoor and dungeon/raid timers in `LLMChatterWorld.cpp`, delegating to
+`LLMChatterProximity.cpp`. Older configs without scoped keys inherit the
+legacy `ScanIntervalSeconds` and `Chance` values:
 
-1. Iterates real players in the world
+1. Iterates alive, out-of-combat real players in eligible maps
 2. Scans within `ProximityChatter.ScanRadius` (default 40 yards) for
-   eligible humanoid NPCs and party bots
-3. NPC eligibility: all humanoids — guards, vendors, trainers,
-   innkeepers, quest givers, citizens, sentinels, children
+   eligible NPCs and party bots
+3. NPC eligibility follows one policy in every supported map: universal
+   life/combat/range/LOS safety checks; `SpeakerDenyEntries`;
+   boss exclusion; guards and strong interactive NPC roles; humanoids;
+   then explicitly allowlisted non-humanoid entries. Everything else is
+   rejected. This permits carefully selected friendly or hostile
+   non-humanoids without making ordinary wildlife or summons talk.
+   Creatures the player cannot detect, non-selectable or fake-dead
+   creatures, engine-marked triggers, and templates carrying the internal
+   `[DND]`/`(DND)`, `[PH]`/`(PH)`, or `[UNUSED]`/`(UNUSED)` markers are
+   always rejected so spell, event, placeholder, and encounter helpers
+   cannot speak.
+   Movement and pathing do not disqualify an otherwise eligible speaker.
 4. Bot eligibility: party bots can participate, but conversations
    where all speakers are party bots are skipped (idle chat handles
    that case)
-5. Rolls `ProximityChatter.TriggerChance` (default 30%)
+5. Rolls `OutdoorChance` or `InstanceChance` for the current map
 6. Selects 1-4 speakers from the candidate pool
 7. Queues either a `proximity_say` (single statement) or
    `proximity_conversation` (multi-speaker) event
 
 NPCs are identified by spawn GUID (`Creature::GetSpawnId()`) rather
-than entry ID, allowing per-instance entity cooldowns (default 60s).
+than entry ID. Map and instance IDs scope cooldowns, active scenes, and
+reply history so separate copies of the same dungeon cannot share
+context. Mutually hostile candidates cannot join one ambient scene.
 
 ### Delivery channels
 
-Two new delivery channels in `LLMChatterDelivery.cpp`:
+Three local delivery channels are handled by
+`LLMChatterDelivery.cpp`:
 
 | Channel | Packet | Visual |
 |---------|--------|--------|
 | `say` | `CHAT_MSG_SAY` | Normal `/say` text for bots |
 | `msay` | `CHAT_MSG_MONSTER_SAY` | NPC speech bubble |
+| `myell` | monster yell | Extended-range boss line |
 
-Speaker facing: each speaker faces the next speaker in the
-conversation sequence via `SetFacingToObject()`. NPCs have their
-orientation reset after delivery via a `BasicEvent` timer.
+Ordinary-scene facing is best effort: a stationary, facing-safe speaker
+may face the next speaker in the conversation sequence via
+`SetFacingToObject()`. Moving or pathing candidates remain eligible and
+speak without being rotated. NPC orientation resets after delivery via a
+`BasicEvent` timer only when facing was applied.
 
 ### Player reply detection
 
-When a real player speaks in `/say` near a recent proximity scene,
-`HandleProximityPlayerSay()` in `LLMChatterGroupCombat.cpp` detects
-the reply and queues a `proximity_reply` event. The `ProximityScene`
+When a real player speaks in `/say`, an explicitly named eligible
+speaker wins, followed by the selected target, a recent scene, and an
+ordinary nearby fallback. Selecting an ineligible nearby creature
+suppresses an unrelated NPC from answering. The `ProximityScene`
 struct tracks:
 
 - active conversation participants
-- scene location and timestamp
+- map, instance, zone, and timestamp
 - the original topic context
 
-This enables natural player-to-NPC/bot exchanges without requiring
-the player to target or emote at anyone.
+This enables natural player-to-NPC/bot exchanges while making direct
+targeting authoritative when the player uses it.
 
-### Topic pool
+### Instance and boss grounding
+
+Every ordinary proximity prompt receives the canonical DBC map name,
+map and instance IDs, zone/current-area names, and existing curated
+dungeon flavor where available. `chatter_instance_context.py` owns this
+shared normalization. NPCs also carry disposition and creature rank.
+Curated non-humanoids additionally carry creature type and their
+qualification reason so the model knows that the individual can speak
+without generalizing that ability to its whole species.
+Normal-mode playerbots treat lore as game knowledge; actual NPCs always
+remain in-world speakers.
+
+Bosses use a separate path in `LLMChatterBossDialogue.cpp` instead of
+joining random ambient scenes. Automatic approach lines and explicitly
+selected/named boss replies require the player and boss to be alive,
+out of combat, in LOS, in the same dungeon/raid instance, within the
+configured boss radius, and beyond calculated aggro range plus the
+safety margin. Delivery checks those conditions again. Boss lines use
+monster yell for audibility and never change facing or threat. Automatic
+lines use a presence session shared by boss spawn and instance, rather
+than one cooldown per player. The first line follows a short random
+delay. Later speaking opportunities use random delays and a decaying
+chance that stops at a configurable floor. A failed roll schedules the
+next delayed opportunity instead of rerolling on every scanner pass.
+The boss therefore retains a small chance to speak throughout a long
+presence. Open-ended opportunities are enabled by default through an
+explicit toggle; disabling that toggle restores the optional hard cap.
+The session
+resets after no eligible player has remained nearby for the configured
+period. Recent delivered boss lines are included in later prompts to
+discourage repeats and paraphrases.
+
+Explicitly addressed `/say` replies keep their separate per-player
+cooldown and postpone the next automatic opportunity without consuming
+the automatic line allowance. Dungeon and raid miniboss qualification
+uses AzerothCore's registered creature encounters first, with boss-rank,
+boss-flag, and single-spawn immunity metadata as fallbacks for special
+encounters not present in that registry. This classifier is also used by
+group-kill chatter, so eligible registered encounters receive the existing
+guaranteed boss-kill reaction rather than normal-trash chance and cooldown
+handling. Enter-combat chatter keeps its narrower legacy classifier. Use
+`BossSpeakerDenyEntries` for encounters whose scripted presentation
+must not receive generated dialogue. Automatic checks use a fair
+round-robin schedule with one player and at most one creature-grid search
+per configured scan pass. Extended searches caused by `/say` have a
+separate per-player/map/instance throttle. During that short window,
+an unrelated line is not consumed merely because a boss remains targeted.
+A short
+boss-name match is ignored when it could refer to different nearby boss
+entries unless the selected target disambiguates it; a full name remains
+authoritative.
+
+### Topic pools
 
 `PROXIMITY_CHAT_TOPICS` in `chatter_constants.py` provides 250+
 topics across 17 categories:
@@ -1942,19 +2077,36 @@ topics across 17 categories:
   faction politics, wildlife, profession, food and drink, history,
   adventure, philosophy, humor, seasonal, and general social
 
+That pool remains the source for NPCs and roleplay-mode playerbots.
+`PROXIMITY_PLAYER_CHAT_TOPICS` supplies normal-mode playerbot `/say`
+subjects such as gameplay progress, interface/keybind observations,
+queues, routes, group needs, and light player banter. Mixed conversations
+receive separate NPC and playerbot topic angles.
+
 ### Python handling
 
-`chatter_proximity.py` owns all three event handlers:
+`chatter_proximity.py` owns the ordinary event handlers:
 
 | Event type | Handler | Behavior |
 |------------|---------|----------|
 | `proximity_say` | Single NPC or bot statement | One speaker, zone context + topic |
 | `proximity_conversation` | Multi-speaker conversation | 2-4 speakers with staggered delivery |
 | `proximity_reply` | Player reply response | NPC/bot replies to player `/say` |
+| `proximity_player_say` | New directed/nearby response | One selected speaker replies |
+| `proximity_player_conversation` | New nearby exchange | Compatible speakers reply |
 
-Prompts include nearby entity names so speakers can address each other
-by name. Uses global `EmoteChance` and `ActionChance` gates (not custom
-proximity-specific ones).
+`chatter_boss_dialogue.py` owns `proximity_boss_approach` and
+`proximity_boss_player_say`. Both produce one message-only `myell` row
+tagged with `owner_subsystem='boss_dialogue'`.
+
+Prompts include up to four distinct nearby entity names so speakers can
+address each other without repeating identical names. One conversation
+also selects at most one speaker with a given display name because the
+response contract identifies speakers by name. Roster entries identify
+each participant as `NPC` or
+`PLAYERBOT`; the prompt keeps NPCs in-world and applies ChatterMode only
+to playerbots. Uses global `EmoteChance` and `ActionChance` gates (not
+custom proximity-specific ones).
 
 ### C++ ownership
 
@@ -1962,20 +2114,23 @@ proximity-specific ones).
 |------|----------------|
 | `LLMChatterProximity.cpp` | Scan, filter, select, queue, scene tracking |
 | `LLMChatterProximity.h` | Declarations for world and group combat |
-| `LLMChatterDelivery.cpp` | `say` and `msay` channel delivery, facing, NPC reset |
-| `LLMChatterWorld.cpp` | Timer delegation |
+| `LLMChatterBossDialogue.cpp/.h` | Staggered boss safe-band scan, unambiguous direction, synchronized state |
+| `LLMChatterDelivery.cpp` | `say`, `msay`, and `myell` delivery with live revalidation |
+| `LLMChatterWorld.cpp` | Delegates staggered boss scan scheduling |
 | `LLMChatterGroupCombat.cpp` | `HandleProximityPlayerSay()` hook |
-| `LLMChatterShared.cpp` | `FindCreatureBySpawnId()`, `GetCreatureRoleName()` |
-| `LLMChatterConfig.h/.cpp` | 15 proximity config members |
+| `LLMChatterShared.cpp` | Creature lookup/role and shared boss cache/classifier |
+| `LLMChatterConfig.h/.cpp` | Ordinary and boss proximity configuration |
 
 ### Python ownership
 
 | File | Responsibility |
 |------|----------------|
-| `chatter_proximity.py` | All 3 event handlers and prompt builders |
+| `chatter_proximity.py` | Ordinary event handlers and prompt builders |
+| `chatter_instance_context.py` | Shared instance location/lore grounding |
+| `chatter_boss_dialogue.py` | Safe one-line boss prompt and `myell` insertion |
 | `chatter_constants.py` | `PROXIMITY_CHAT_TOPICS` (250+ entries) |
 | `chatter_db.py` | `npc_spawn_id` and `player_guid` params on insert |
-| `chatter_event_registry.py` | 3 new `EventSpec` entries |
+| `chatter_event_registry.py` | Ordinary and boss event routing |
 
 ### Config keys
 
@@ -1984,20 +2139,42 @@ All under `LLMChatter.ProximityChatter.*`:
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `Enable` | 1 | Master toggle |
-| `CheckIntervalSeconds` | 30 | Scan timer interval |
+| `EnableInDungeons` | 1 | Allow ordinary proximity in dungeons |
+| `EnableInRaids` | 1 | Allow ordinary proximity in raids |
+| `ScanIntervalSeconds` | 30 | Compatibility fallback for missing scoped intervals |
+| `OutdoorScanIntervalSeconds` | 30 | Ordinary outdoor scan timer interval |
+| `InstanceScanIntervalSeconds` | 30 | Ordinary dungeon/raid scan timer interval |
 | `ScanRadius` | 40 | Yards around player to scan |
-| `TriggerChance` | 30 | % chance per scan per player |
-| `ConversationChance` | 50 | % multi-speaker vs single statement |
+| `PlayerSayScanRadius` | 40 | New-scene `/say` response radius |
+| `SpeakerAllowEntries` | empty | Explicitly approved non-humanoid creature entries |
+| `SpeakerDenyEntries` | empty | Ordinary speaker exclusions; overrides all qualifications |
+| `Chance` | 30 | Compatibility fallback for missing scoped chances |
+| `OutdoorChance` | 30 | % chance per eligible outdoor scan |
+| `InstanceChance` | 100 | % chance per eligible dungeon/raid scan |
+| `ConversationChance` | 40 | % multi-speaker vs single statement |
 | `EntityCooldown` | 60 | Seconds per-entity (spawn GUID) cooldown |
-| `PlayerAddressChance` | 20 | % chance to address the real player |
-| `MaxSpeakers` | 4 | Maximum speakers per conversation |
-| `LineDelayMin` | 3 | Min seconds between conversation lines |
-| `LineDelayMax` | 5 | Max seconds between conversation lines |
-| `ReplyWindowSeconds` | 60 | How long a scene stays active for replies |
-| `ReplyChance` | 80 | % chance to reply when player speaks in scene |
-| `MaxTopicLength` | 0 | Max topic hint length (0 = no limit) |
-| `NPCOnly` | 0 | When 1, only NPCs speak (no party bots) |
-| `ListenRange` | 40 | `/say` audibility range (should match ScanRadius) |
+| `PlayerAddressChance` | 30 | % chance to address the real player |
+| `MaxConversationLines` | 4 | Maximum ambient lines |
+| `ConversationLineDelay` | 2 | Seconds between lines |
+| `ReplyWindowSeconds` | 30 | How long a scene accepts replies |
+| `ReplyMaxTurns` | 5 | Maximum tracked scene turns |
+| `EnableBossDialogue` | 0 | Boss path; enable for controlled testing |
+| `BossApproachCheckIntervalSeconds` | 2 | Interval between one-player round-robin scan passes |
+| `BossApproachMaxRadius` | 80 | Extended boss detection/yell radius |
+| `BossAggroSafetyMargin` | 0 | Extra yards required beyond live aggro range |
+| `BossInitialDelayMinSeconds` | 2 | Minimum delay before the guaranteed first automatic line |
+| `BossInitialDelayMaxSeconds` | 6 | Maximum delay before the guaranteed first automatic line |
+| `BossRepeatDelayMinSeconds` | 20 | Minimum delay between later automatic opportunities |
+| `BossRepeatDelayMaxSeconds` | 60 | Maximum delay between later automatic opportunities |
+| `BossRepeatChance` | 80 | Chance that the second automatic opportunity speaks |
+| `BossRepeatChanceDecayPercent` | 50 | Multiplier applied to each later repeat chance |
+| `BossRepeatChanceFloor` | 10 | Persistent minimum repeat chance after decay |
+| `BossUnlimitedAutomaticLines` | 1 | Keep randomized opportunities open-ended |
+| `BossMaxAutomaticLines` | 3 | Cap used only when unlimited mode is disabled; zero then disables automatic lines |
+| `BossPresenceResetSeconds` | 90 | Eligible-player absence needed to begin a new presence |
+| `BossDirectedReplyCooldownSeconds` | 15 | Directed reply cooldown |
+| `BossDirectedScanCooldownSeconds` | 1 | Per-player/map/instance `/say` search throttle |
+| `BossSpeakerDenyEntries` | empty | Comma-separated excluded boss entries |
 
 ### Schema changes
 
@@ -2011,12 +2188,19 @@ Migration `20260403_proximity_chatter.sql` adds two columns to
 
 Base schema `00000000_llm_chatter_tables.sql` updated to match.
 
+Migration `20260908_instance_proximity_boss_events.sql` extends the
+`llm_chatter_events.event_type` enum with `proximity_boss_approach`
+and `proximity_boss_player_say`. Existing installations require this
+migration before boss dialogue can be enabled. Fresh installs receive
+the event types from the base schema.
+
 ---
 
 ## 13r. Guild Chat Statements and Conversations
 
-Guild chatter is an optional, RP-only ambient channel. It is enabled
-by default and can be disabled with the master toggle.
+Guild chatter is an optional ambient channel. It is enabled by default,
+can be disabled with the master toggle, and follows the configured
+playerbot chatter mode.
 
 ### Trigger and participant ownership
 
@@ -2047,8 +2231,8 @@ are interpreted as legacy statements.
 
 ### Topic and prompt policy
 
-`chatter_guild.py` selects one entry from
-`GUILD_CHAT_TOPICS_RP` for the whole event. A single
+`chatter_guild.py` selects one entry from `GUILD_CHAT_TOPICS` in normal
+mode or `GUILD_CHAT_TOPICS_RP` in roleplay mode for the whole event. A single
 `GuildChatter.ZoneNameChance` roll also applies to the whole event.
 
 A separate `GuildChatter.HistoryContextChance` roll decides whether
@@ -2336,7 +2520,7 @@ One LLM request generates the complete greeting sequence. Prompts:
 - ask for one distinct 3-12-word greeting per selected bot
 - forbid bot-to-bot conversation
 - forbid invented absence length, destination, or player intent
-- retain the normal Guild cross-zone and RP-only rules
+- retain the normal Guild cross-zone and configured chatter-mode rules
 - allow only the primary greeter to be asked to use the player's name
 - enforce `LoginGreeting.MaxCharacters` after cleanup
 

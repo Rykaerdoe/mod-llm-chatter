@@ -146,7 +146,7 @@ def _evict_zone_delivery_cache() -> None:
 
     Entries older than 1 hour are irrelevant — no
     meaningful gap enforcement needed after that long.
-    Called probabilistically from _zone_delivery_delay
+    Called probabilistically from the zone reservation
     (~1% of calls) to bound memory growth.
     """
     cutoff = time.monotonic() - 3600
@@ -158,35 +158,52 @@ def _evict_zone_delivery_cache() -> None:
         del _zone_last_delivery[k]
 
 
-def _zone_delivery_delay(zone_id, config) -> float:
-    """Return extra delay (seconds) to enforce a
-    minimum gap between General messages in a zone.
+def _reserve_zone_delivery_window(
+    zone_id, config, duration_seconds=0.0,
+) -> float:
+    """Atomically reserve a General delivery window.
 
-    Returns 0 if enough time has passed since the
-    last delivery in this zone.
-
-    Shared between ambient and player-reaction paths
-    so both contribute to and respect the same gap.
-    Thread-safe: read-compute-write is under lock.
+    Returns the delay before the window may begin. The
+    reservation remains occupied through
+    ``duration_seconds``, so another automated sequence
+    cannot schedule follow-up lines over this one.
     """
     # Probabilistic eviction (~1% chance per call)
-    if random.random() < 0.01:
-        _evict_zone_delivery_cache()
-
-    gap = float(config.get(
+    gap = max(0.0, float(config.get(
         'LLMChatter.GeneralChat.MinZoneGap',
         _ZONE_GAP_DEFAULT
-    ))
+    )))
+    duration = max(0.0, float(duration_seconds))
     with _zone_gap_lock:
+        if random.random() < 0.01:
+            _evict_zone_delivery_cache()
+
         now = time.monotonic()
         last = _zone_last_delivery.get(zone_id, 0)
-        elapsed = now - last
-        if elapsed >= gap:
-            _zone_last_delivery[zone_id] = now
-            return 0
-        extra = gap - elapsed
-        _zone_last_delivery[zone_id] = now + extra
-        return extra
+        start = max(now, last + gap)
+        _zone_last_delivery[zone_id] = start + duration
+        return start - now
+
+
+def _extend_zone_delivery_window(
+    zone_id, delay_seconds,
+) -> None:
+    """Extend, but never shorten, a zone reservation."""
+    projected = time.monotonic() + max(
+        0.0, float(delay_seconds)
+    )
+    with _zone_gap_lock:
+        _zone_last_delivery[zone_id] = max(
+            projected,
+            _zone_last_delivery.get(zone_id, 0),
+        )
+
+
+def _zone_delivery_delay(zone_id, config) -> float:
+    """Reserve one General message and return its delay."""
+    return _reserve_zone_delivery_window(
+        zone_id, config, duration_seconds=0.0,
+    )
 
 
 # =============================================================================
@@ -614,7 +631,7 @@ def build_race_class_context_parts(
     )
 
 
-def build_bot_state_context(extra_data):
+def build_bot_state_context(extra_data, mode='roleplay'):
     """Build natural-language state description
     from C++ bot_state data in extra_data."""
     if not extra_data:
@@ -623,6 +640,8 @@ def build_bot_state_context(extra_data):
     if not state or not isinstance(state, dict):
         return ""
 
+    from chatter_mode import is_roleplay
+    roleplay = is_roleplay(mode)
     parts = []
 
     # Real role (replaces CLASS_ROLE_MAP guessing)
@@ -645,15 +664,21 @@ def build_bot_state_context(extra_data):
     if hp is not None:
         hp = int(hp)
         if hp <= 20:
-            parts.append(
-                f"You are critically wounded "
-                f"({hp}% health)."
-            )
+            if roleplay:
+                parts.append(
+                    f"You are critically wounded ({hp}% health)."
+                )
+            else:
+                parts.append(
+                    f"Your character is critically low on health ({hp}%)."
+                )
         elif hp <= 50:
-            parts.append(
-                f"You are injured "
-                f"({hp}% health)."
-            )
+            if roleplay:
+                parts.append(f"You are injured ({hp}% health).")
+            else:
+                parts.append(
+                    f"Your character is low on health ({hp}%)."
+                )
 
     # Mana (skip for non-mana classes: -1 sentinel)
     mp = state.get('mana_pct')
@@ -674,16 +699,19 @@ def build_bot_state_context(extra_data):
     # Current target
     target = state.get('target', '')
     if target:
-        parts.append(
-            f"You are currently fighting "
-            f"{target}."
-        )
+        subject = "You are" if roleplay else "Your character is"
+        parts.append(f"{subject} currently fighting {target}.")
 
     travel_ctx = format_travel_context(
         state.get('travel_state')
     )
     if travel_ctx:
-        parts.append(travel_ctx)
+        if roleplay:
+            parts.append(travel_ctx)
+        else:
+            parts.append(
+                f"Character gameplay travel state: {travel_ctx}"
+            )
 
     return ' '.join(parts)
 
@@ -1046,10 +1074,11 @@ def get_dungeon_bosses(
 ) -> list:
     """Get boss names for a dungeon/raid map.
 
-    Queries creature + creature_template from
-    acore_world. Detects bosses via:
+    Uses registered creature encounters first, then the established
+    metadata fallback for unregistered special bosses:
+    - instance_encounters creature credits
     - rank=3 (raid bosses)
-    - CreatureImmunitiesId > 0 AND single spawn
+    - positive CreatureImmunitiesId AND single spawn
       (named dungeon bosses — immune mobs that
       spawn only once per map are reliably bosses;
       multi-spawn immune mobs like Molten Elementals
@@ -1062,7 +1091,18 @@ def get_dungeon_bosses(
         cursor = db.cursor(dictionary=True)
         entry_col = get_creature_entry_column(db)
         cursor.execute(f"""
-            SELECT ct.name
+            SELECT ct.name AS name
+            FROM acore_world.creature_template ct
+            JOIN acore_world.creature c
+                ON c.{entry_col} = ct.entry
+            WHERE c.map = %s
+                AND ct.entry IN (
+                    SELECT ie.creditEntry
+                    FROM acore_world.instance_encounters ie
+                    WHERE ie.creditType = 0
+                )
+            UNION
+            SELECT ct.name AS name
             FROM acore_world.creature_template ct
             JOIN acore_world.creature c
                 ON c.{entry_col} = ct.entry
@@ -1072,7 +1112,7 @@ def get_dungeon_bosses(
             GROUP BY ct.entry, ct.name, ct.`rank`
             HAVING ct.`rank` = 3 OR COUNT(*) = 1
             ORDER BY ct.name
-        """, (map_id,))
+        """, (map_id, map_id))
         bosses = [
             row['name']
             for row in cursor.fetchall()
@@ -1791,6 +1831,7 @@ def run_single_reaction(
     max_tokens_override: int = None,
     context: str = '',
     message_transform: Any = None,
+    delay_resolver: Any = None,
     metadata: dict = None,
     label: str = 'single_reaction',
     num_bots: int = 1,
@@ -1809,8 +1850,9 @@ def run_single_reaction(
     3. strip_speaker_prefix
     4. cleanup_message
     5. length clamp
-    6. optional emote fallback
-    7. insert_chat_message
+    6. optional delivery-delay resolution
+    7. optional emote fallback
+    8. insert_chat_message
 
     Returns:
       {'ok': bool, 'message': str|None, 'emote': str|None,
@@ -1895,6 +1937,20 @@ def run_single_reaction(
     if len(message) > 255:
         message = message[:252] + "..."
 
+    resolved_delay = delay_seconds
+    if callable(delay_resolver):
+        try:
+            resolved_delay = float(
+                delay_resolver(message)
+            )
+        except Exception:
+            return {
+                'ok': False,
+                'message': message,
+                'emote': None,
+                'error_reason': 'delay_resolver_error',
+            }
+
     emote = parsed.get('emote')
 
     try:
@@ -1904,7 +1960,7 @@ def run_single_reaction(
             speaker_name,
             message,
             channel=channel,
-            delay_seconds=delay_seconds,
+            delay_seconds=resolved_delay,
             event_id=event_id,
             sequence=sequence,
             emote=emote,
@@ -1930,6 +1986,7 @@ def run_single_reaction(
         'ok': True,
         'message': message,
         'emote': emote,
+        'delay_seconds': resolved_delay,
         'error_reason': None,
     }
 
