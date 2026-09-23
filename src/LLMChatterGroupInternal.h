@@ -158,6 +158,7 @@ extern std::unordered_map<uint32, time_t>
     _emoteVerbalCooldowns;
 extern std::unordered_map<uint32, time_t>
     _creatureEmoteCooldowns;
+extern std::mutex _emoteCooldownMutex;
 
 // -- Pending rejoin queue (relog) --
 struct PendingRejoin
@@ -218,7 +219,11 @@ void EnsureGroupJoinQueued(
 void HandleEmoteAtGroupBot(
     Player* player, Player* targetBot,
     uint32 textEmote, Group* group);
-void HandleEmoteAtCreature(
+bool HasPlayerbotMirrorEmote(uint32 textEmote);
+uint32 HandleEmoteAtUngroupedBot(
+    Player* player, Player* targetBot,
+    uint32 textEmote);
+uint32 HandleEmoteAtCreature(
     Player* player, Creature* creature,
     uint32 textEmote);
 void HandleEmoteObserver(
@@ -246,6 +251,7 @@ enum EmoteTargetType
     EMOTE_TGT_GROUP_PLAYER,
     EMOTE_TGT_EXT_PLAYER,
     EMOTE_TGT_CREATURE,
+    EMOTE_TGT_UNGROUPED_BOT,
 };
 
 #endif

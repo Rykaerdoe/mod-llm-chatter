@@ -1,5 +1,196 @@
 # Changelog
 
+### 2026-09-22 - Player-Initiated Chat Responsiveness
+
+* **Required conversational replies**: Shared semantic intent analysis now
+  reports whether player speech requires an answer. Questions and other
+  answer-seeking messages always continue to response generation, while the
+  LLM may still identify brief casual statements that need no reply without
+  relying on phrase lists or punctuation matching.
+* **Faster player-facing pacing**: Player-authored General messages now use
+  full reply and reaction chances with no channel cooldown. Party, Guild, and
+  directed proximity cooldowns are substantially shorter, while natural
+  response delays remain so replies feel conversational rather than
+  instantaneous.
+* **Same-faction response routing**: General, Party, Guild, Guild login, and
+  proximity reply paths now constrain eligible Playerbots to the player's
+  faction. General history and relay context are faction-scoped as well, and
+  final delivery rejects confirmed team mismatches without discarding valid
+  replies when a player is briefly unavailable during a map transition.
+
+### 2026-09-20 - Party Player Replies
+
+* **Party replies no longer use optional silence**: Player-authored Party
+  messages always continue to response generation once queued. Brief casual
+  classification still keeps lightweight replies concise, while the optional
+  silence chance remains available for Guild, General, proximity speech, and
+  directed boss speech. If two generated brief replies exceed the output
+  contract, Party uses a deterministic per-speaker bounded fallback instead
+  of dropping the statement or conversation. Casual multi-addressee messages
+  therefore retain every selected responder.
+
+### 2026-09-20 - Configurable Player-Chat Prefix Filtering
+
+* **Early visible-chat filtering**: Server owners can configure a
+  comma-separated `LLMChatter.PlayerChat.IgnoredPrefixes` denylist for real
+  player messages in Party, General, Guild, and `/say`. Matching ignores
+  leading whitespace and ASCII letter case, and matched messages are skipped
+  before Chatter writes history, changes conversation state or cooldowns,
+  cancels Guild login greetings, or queues LLM work. The player's normal game
+  chat remains unaffected.
+* **Reload-safe and compatibility-preserving**: The default-empty list is
+  published through the module's reload-safe configuration pattern and can be
+  changed with `.reload config`. Existing `LANG_ADDON`, hidden-payload, and
+  Playerbot-command protections remain independent. Documentation clarifies
+  that normal `SendAddonMessage` prefixes do not belong in this list and that
+  configured entries are trimmed, so distinctive punctuation-bearing
+  prefixes are recommended.
+
+### 2026-09-20 - Contextual Short Player Replies
+
+* **Conversational scale matching**: Guild, General, party,
+  proximity-speech, and proximity-emote prompts now answer brief casual
+  player input in kind instead of expanding it into prose or a new topic.
+  Semantically classified player-speech turns use one responder by default, a
+  hard 2-8-word / 50-character contract, and one strict rewrite attempt if
+  generation exceeds it. Directed player-emote prompts request the same short
+  scale without adding a second semantic/RNG gate. Guild may use a tiny
+  narrator action; nearby party/proximity reactions may use a real emote
+  without an empty chat line.
+* **Implicit reply routing**: Shared semantic intent analysis can resolve an
+  unnamed reply to the immediately prior bot from recent chat context. Brief
+  single-addressee Guild continuations stay with that speaker and suppress
+  multi-bot, callback, name, and follow-up-question embellishments without a
+  hardcoded phrase list.
+* **Natural conversational silence**: The same semantic analysis can mark a
+  brief casual turn as safe to leave unanswered. Guild, General, party, and
+  proximity speech then make one configurable RNG roll, replying only 20% of
+  the time by default and skipping generation otherwise. Questions, requests,
+  warnings, and other turns that clearly expect a response bypass this gate.
+* **Safe emote-only delivery**: Empty-text reactions are accepted only for
+  semantically brief player speech or explicit player-emote events. Unknown
+  emotes are dropped instead of retrying forever, `rofl` has a matching C++
+  mapping, and party emotes retain battleground combat-emote restrictions.
+
+### 2026-09-19 - Real General Loot and Trade Items
+
+* **Real loot announcements**: General-channel loot chatter now comes from
+  successful playerbot loot events instead of database-simulated drops. The
+  bounded collector samples one item per loot source, limits announcements to
+  zones with a same-team real-player audience, and defaults to uncommon or
+  better items.
+* **Real trade offers**: Ambient trade chatter now snapshots a tradable item
+  from the selected bot's live backpack and equipped bags only when trade is
+  chosen. Messages therefore reflect the item's current stack count, while a
+  configurable quality bonus makes rarer eligible items more likely without
+  excluding common items.
+* **Safe queue contract**: C++ now selects the ambient message type and sends
+  value-only item context through the chatter queue. The worker-thread loot
+  path avoids database, session, channel, and random-bot-manager access; the
+  world-thread flush performs authoritative eligibility and cooldown checks.
+  The character-database migration adds the queue fields required by this
+  contract, and the obsolete simulated-loot path has been removed.
+
+### 2026-09-18 - Directed Playerbot Proximity Reactions
+
+* **Ungrouped playerbot responses**: Eligible same-team playerbots outside the
+  player's group can mirror directed emotes, answer them in local `/say`, and
+  participate with nearby NPCs or other ungrouped bots in one shared scene.
+  If the addressed bot stays silent, a separately gated witness scene may
+  still let one or two nearby entities comment on the same real player action.
+  Mounted playerbots remain eligible for these direct and responsive paths,
+  while automatic and untargeted selection continues to exclude them at
+  queue and delivery time. Delayed bot mirrors are revalidated for combat,
+  player presence, map, and range before the packet is sent. The shared
+  delayed event means grouped mirrors now use the same map/range safety rule,
+  with a one-yard minimum radius; grouped speech remains unchanged.
+* **Consistent reaction probabilities**: Distributed defaults are now 80% for
+  direct emote mirroring and speech, and 50% for observer or silent-target
+  witness scenes. Grouped-bot mirroring and speech are independent, including
+  speech for emotes without a mirror animation mapping.
+* **Bounded directed scenes**: Directed interactions now involve at most the
+  addressed entity plus two joiners. Ordinary joiner counts use 60/30/10 for
+  zero, one, or two joiners; witness-only scenes use 70/30 for one or two.
+  This changes the defaults of `MirrorChance`, `ReactionChance`,
+  `ObserverChance`, `DirectedMaxExtraReactors`, and
+  `DirectedExtraReactorWeights`; explicitly configured installations retain
+  their configured values.
+
+### 2026-09-15 - Multidirectional NPC Interactions
+
+* **Reliable direct NPC replies**: Eligible ordinary NPCs now receive a
+  directed `/say` attempt when selected or unambiguously addressed by name.
+  Vocative punctuation resolves explicit overrides without allowing casual
+  name mentions to steal another selected NPC's reply. Direct interaction
+  remains available while the player is mounted.
+* **Nearby NPC participation**: Directed `/say` and emote interactions can
+  select zero to three additional eligible NPCs using configurable descending
+  weights. Conversations support player-inclusive reactions and NPC asides,
+  require the addressed NPC to speak first, and never generate dialogue for
+  the real player.
+* **Verbal emote reactions**: Eligible NPCs have a configurable 80% chance to
+  speak after a directed social emote, independently of their mirrored
+  animation. SmartAI and known C++ emote handlers suppress duplicate chatter,
+  and synchronized cooldown state keeps map-thread emotes safe.
+* **Responsive interaction timing**: Directed work uses high priority and a
+  short configurable expiry. Direct ordinary-NPC `/say` has no reply cooldown,
+  while entity reuse, verbal emotes, and directed boss replies are
+  configurable and capped at three seconds.
+* **Context and delivery integrity**: Recent player lines, directed emotes,
+  and successfully delivered NPC speech are scoped to the addressed NPC.
+  Per-line addressee identifiers support NPC-to-player and NPC-to-NPC facing;
+  unsafe scripted movement is never rotated. Directed delivery revalidation
+  failures record a drop reason and cancel later lines in the affected scene.
+* **Configuration and upgrade path**: The main template, quieter preset, and
+  contributor documentation expose the new reaction, participant, timing,
+  naming, and exclusion controls. Existing installations must apply
+  `data/sql/characters/updates/20260914_npc_multidirectional_interactions.sql`
+  before running the updated worldserver or bridge; fresh installs receive the
+  matching base schema.
+
+### 2026-09-14 - Model Compatibility and Provider Switching
+
+* **Model-aware requests**: OpenAI-compatible calls now select the safe
+  token-limit, temperature, and reasoning parameters for the configured
+  provider and model. Explicit provider rejections receive narrowly scoped
+  retries whose successful corrections are cached for the bridge process.
+* **Reasoning-safe budgets**: Direct OpenAI reasoning models can use the new
+  `LLMChatter.OpenAI.MaxTokensMultiplier`. Hidden reasoning receives a larger
+  completion budget while models running with supported `none` effort retain
+  the original low-cost limit.
+* **Consistent call paths**: Normal chatter, quick analysis, startup health
+  checks, screenshot vision, and offline lore generation use the shared
+  compatibility layer. Fine-tuned OpenAI IDs inherit their base-model profile.
+* **Portable providers**: Setup and configuration guidance now covers direct
+  Anthropic, OpenAI, Google Gemini, OpenRouter, and local Ollama targets with
+  explicit model-ID and parameter formats.
+* **Ollama corrections**: Removed the ineffective per-request context option.
+  Context is configured on the Ollama server, while thinking can be disabled
+  through `reasoning_effort = none` with `/no_think` retained as a fallback.
+
+### 2026-09-14 - Rejoin Farewell Reliability
+
+* **Farewells survive bridge restarts**: Bots that silently rejoin an existing
+  group session now prepare their farewell state even though their visible
+  greeting remains suppressed. Removing those bots therefore still produces
+  their expected farewell message after a bridge restart.
+* **Single and batch coverage**: Regression tests protect both individual and
+  batched rejoin paths without introducing duplicate greetings.
+
+### 2026-09-13 - Existing-Install Spell DBC Repair
+
+* **Legacy override cleanup**: Added an idempotent world-database
+  migration that removes incomplete rank-one talent `spell_dbc` rows
+  created by chatter versions before April 9, 2026. These placeholder
+  overrides could hide the real client spell effects and trigger broad
+  SpellScript validation warnings during worldserver startup.
+* **Custom overrides preserved**: Cleanup requires the legacy
+  all-default gameplay-field signature, so complete overrides supplied
+  by other modules or administrators are retained.
+* **Upgrade guidance**: Existing affected installations must apply
+  `data/sql/world/updates/20260913_remove_legacy_spell_dbc_placeholders.sql`
+  and restart worldserver. Fresh installations are unaffected.
+
 ### 2026-09-09 - General Channel Pacing
 
 * **Cross-source conversation spacing**: Automated ambient, transport,
@@ -8,7 +199,7 @@
   scheduled window, preventing independently generated follow-ups from
   arriving in a wall while keeping player-directed replies responsive.
 * **Quieter production preset**: Added
-  `conf/mod_ll_chatter_quieter.conf.dist` as an optional lower-volume
+  `conf/presets/mod_ll_chatter_quieter.conf.dist` as an optional lower-volume
   configuration. It preserves contextual combat and instance reactions while
   reducing cumulative ambient chatter. Credentials and local diagnostic
   settings are intentionally excluded or disabled.

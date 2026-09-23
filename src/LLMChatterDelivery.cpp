@@ -25,12 +25,24 @@
 #include "WorldSession.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cctype>
+#include <cstdio>
+#include <ctime>
 #include <limits>
+#include <map>
 
 namespace
 {
+using SceneFacingKey = std::pair<uint32, uint32>;
+struct SceneFacingState
+{
+    float orientation;
+    time_t updatedAt;
+    uint32 playerGuid;
+};
+static std::map<SceneFacingKey, SceneFacingState>
+    _sceneOriginalFacings;
+
 class DelayedNPCFacingResetEvent : public BasicEvent
 {
 public:
@@ -69,6 +81,46 @@ private:
     float _orientation;
 };
 
+void ScheduleSceneFacingResets(
+    uint32 eventId, uint32 delaySeconds)
+{
+    if (!eventId)
+        return;
+
+    for (auto it = _sceneOriginalFacings.begin();
+         it != _sceneOriginalFacings.end();)
+    {
+        if (it->first.first != eventId)
+        {
+            ++it;
+            continue;
+        }
+
+        uint32 spawnId = it->first.second;
+        SceneFacingState const state = it->second;
+        ObjectGuid playerGuid =
+            ObjectGuid::Create<HighGuid::Player>(
+                state.playerGuid);
+        Player* player =
+            ObjectAccessor::FindConnectedPlayer(
+                playerGuid);
+        Creature* creature = player && player->IsInWorld()
+            ? FindCreatureBySpawnId(
+                player->GetMap(), spawnId)
+            : nullptr;
+        if (creature && creature->IsInWorld())
+        {
+            creature->m_Events.AddEvent(
+                new DelayedNPCFacingResetEvent(
+                    playerGuid, spawnId,
+                    state.orientation),
+                creature->m_Events.CalculateTime(
+                    delaySeconds * IN_MILLISECONDS));
+        }
+        it = _sceneOriginalFacings.erase(it);
+    }
+}
+
 uint32 ExtractJsonUInt(
     std::string const& json, char const* key)
 {
@@ -103,13 +155,102 @@ uint32 ExtractJsonUInt(
     }
     return foundDigit ? static_cast<uint32>(value) : 0;
 }
+
+bool HasNonEmptyJsonString(
+    std::string const& json, char const* key)
+{
+    if (!key || !*key)
+        return false;
+
+    std::string marker = std::string("\"")
+        + key + "\":";
+    size_t pos = json.find(marker);
+    if (pos == std::string::npos)
+        return false;
+    pos += marker.size();
+    while (pos < json.size()
+        && std::isspace(
+            static_cast<unsigned char>(json[pos])))
+    {
+        ++pos;
+    }
+    if (pos >= json.size() || json[pos] != '"')
+        return false;
+    ++pos;
+    return pos < json.size() && json[pos] != '"';
+}
+
+bool IsDirectedProximityEvent(
+    std::string const& eventType)
+{
+    return eventType == "proximity_player_say"
+        || eventType == "proximity_player_conversation"
+        || eventType == "proximity_player_emote";
+}
+
+bool IsFactionBoundReplyEvent(
+    std::string const& eventType)
+{
+    return eventType == "player_general_msg"
+        || eventType == "bot_group_player_msg"
+        || eventType == "guild_player_message"
+        || eventType == "guild_login_greeting";
+}
+
+void FinalizeDroppedMessage(
+    uint32 messageId,
+    uint32 eventId,
+    uint32 sequence,
+    std::string const& eventType,
+    char const* reason)
+{
+    CharacterDatabase.DirectExecute(
+        "UPDATE llm_chatter_messages "
+        "SET delivered = 1, delivered_at = NOW(), "
+        "drop_reason = '{}' WHERE id = {}",
+        EscapeString(reason ? reason : "delivery_failed"),
+        messageId);
+
+    if (!eventId || !IsDirectedProximityEvent(eventType))
+        return;
+
+    CharacterDatabase.DirectExecute(
+        "UPDATE llm_chatter_messages "
+        "SET delivered = 1, delivered_at = NOW(), "
+        "drop_reason = 'cancelled_after_directed_drop' "
+        "WHERE event_id = {} AND sequence > {} "
+        "AND delivered = 0",
+        eventId, sequence);
+
+    ScheduleSceneFacingResets(
+        eventId,
+        sLLMChatterConfig
+            ? sLLMChatterConfig
+                  ->_proxChatterFacingResetDelay
+            : 0);
+}
 } // namespace
 
 void DeliverPendingMessagesImpl()
 {
+    time_t now = time(nullptr);
+    for (auto it = _sceneOriginalFacings.begin();
+         it != _sceneOriginalFacings.end();)
+    {
+        if (now - it->second.updatedAt > 120)
+        {
+            uint32 staleEventId = it->first.first;
+            ScheduleSceneFacingResets(staleEventId, 0);
+            it = _sceneOriginalFacings.begin();
+        }
+        else
+            ++it;
+    }
+
     CharacterDatabase.DirectExecute(
         "UPDATE llm_chatter_messages "
-        "SET delivered = 1, delivered_at = NOW() "
+        "SET delivered = 1, delivered_at = NOW(), "
+        "drop_reason = 'expired_before_delivery' "
         "WHERE delivered = 0 "
         "AND deliver_at < DATE_SUB(NOW(), "
         "INTERVAL 60 SECOND)");
@@ -135,7 +276,11 @@ void DeliverPendingMessagesImpl()
             "m.sequence, m.event_id, e.zone_id, "
             "m.group_id, m.delivery_policy, "
             "m.delivery_reason, m.owner_subsystem, "
-            "e.map_id, e.extra_data "
+            "m.addressee_player_guid, "
+            "m.addressee_bot_guid, "
+            "m.addressee_npc_spawn_id, "
+            "e.map_id, e.extra_data, e.event_type, "
+            "e.subject_guid "
             "FROM llm_chatter_messages m "
             "LEFT JOIN llm_chatter_events e "
             "ON m.event_id = e.id "
@@ -165,7 +310,11 @@ void DeliverPendingMessagesImpl()
             "m.sequence, m.event_id, e.zone_id, "
             "m.group_id, m.delivery_policy, "
             "m.delivery_reason, m.owner_subsystem, "
-            "e.map_id, e.extra_data "
+            "m.addressee_player_guid, "
+            "m.addressee_bot_guid, "
+            "m.addressee_npc_spawn_id, "
+            "e.map_id, e.extra_data, e.event_type, "
+            "e.subject_guid "
             "FROM llm_chatter_messages m "
             "LEFT JOIN llm_chatter_events e "
             "ON m.event_id = e.id "
@@ -197,7 +346,7 @@ void DeliverPendingMessagesImpl()
     // Final delivered_at is set after send.
     CharacterDatabase.DirectExecute(
         "UPDATE llm_chatter_messages "
-        "SET delivered = 1 "
+        "SET delivered = 1, drop_reason = NULL "
         "WHERE id = {} AND delivered = 0",
         messageId);
     uint32 botGuid = fields[1].Get<uint32>();
@@ -247,18 +396,38 @@ void DeliverPendingMessagesImpl()
         fields[14].IsNull()
             ? ""
             : fields[14].Get<std::string>();
-    bool hasEventMapId = !fields[15].IsNull();
+    uint32 addresseePlayerGuid =
+        fields[15].IsNull()
+            ? 0
+            : fields[15].Get<uint32>();
+    uint32 addresseeBotGuid =
+        fields[16].IsNull()
+            ? 0
+            : fields[16].Get<uint32>();
+    uint32 addresseeNPCSpawnId =
+        fields[17].IsNull()
+            ? 0
+            : fields[17].Get<uint32>();
+    bool hasEventMapId = !fields[18].IsNull();
     uint32 eventMapId =
         !hasEventMapId
             ? 0
-            : fields[15].Get<uint32>();
+            : fields[18].Get<uint32>();
     std::string eventExtraData =
-        fields[16].IsNull()
+        fields[19].IsNull()
             ? ""
-            : fields[16].Get<std::string>();
+            : fields[19].Get<std::string>();
     uint32 eventInstanceId =
         ExtractJsonUInt(
             eventExtraData, "instance_id");
+    std::string eventType =
+        fields[20].IsNull()
+            ? ""
+            : fields[20].Get<std::string>();
+    uint32 eventSubjectGuid =
+        fields[21].IsNull()
+            ? 0
+            : fields[21].Get<uint32>();
 
     // Master General-channel toggle. If General chatter is
     // disabled, deliberately consume any already-queued General
@@ -268,7 +437,12 @@ void DeliverPendingMessagesImpl()
     // .reload config takes effect immediately for pending rows.
     if (channel == "general"
         && !sLLMChatterConfig->_generalChannelEnable)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType, "general_disabled");
         return;
+    }
 
     // Master GroupChatter toggle. Party/raid channels are
     // shared by group, raid-boss, and BG chatter, so we gate
@@ -279,7 +453,12 @@ void DeliverPendingMessagesImpl()
     // immediately for pending rows via .reload config.
     if (ownerSubsystem == "group"
         && !sLLMChatterConfig->_useGroupChatter)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType, "group_chatter_disabled");
         return;
+    }
 
     // Master ProximityChatter toggle. Consume already-queued
     // proximity rows (open-world say/msay) when proximity
@@ -289,10 +468,20 @@ void DeliverPendingMessagesImpl()
     if ((ownerSubsystem == "proximity"
             || ownerSubsystem == "boss_dialogue")
         && !sLLMChatterConfig->_proxChatterEnable)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType, "proximity_chatter_disabled");
         return;
+    }
     if (ownerSubsystem == "boss_dialogue"
         && !sLLMChatterConfig->_proxBossDialogueEnable)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType, "boss_dialogue_disabled");
         return;
+    }
 
     // Master GuildChatter toggle. Consume already-queued
     // guild rows when guild chatter is disabled, so flipping
@@ -301,7 +490,12 @@ void DeliverPendingMessagesImpl()
     // retry path resets delivered = 0 and retries forever).
     if (ownerSubsystem == "guild"
         && !sLLMChatterConfig->_guildChatterEnable)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType, "guild_chatter_disabled");
         return;
+    }
 
     ObjectGuid guid =
         ObjectGuid::Create<HighGuid::Player>(
@@ -317,6 +511,23 @@ void DeliverPendingMessagesImpl()
             bot = nullptr;
     }
 
+    if (bot && eventSubjectGuid
+        && IsFactionBoundReplyEvent(eventType))
+    {
+        Player* subject = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(
+                eventSubjectGuid));
+        if (subject
+            && subject->GetTeamId()
+                != bot->GetTeamId())
+        {
+            FinalizeDroppedMessage(
+                messageId, eventId, sequence,
+                eventType, "faction_mismatch");
+            return;
+        }
+    }
+
     // Only mark delivered after a successful
     // send (or if the bot is unavailable and
     // retrying would not help).
@@ -325,6 +536,8 @@ void DeliverPendingMessagesImpl()
         (channel == "msay" || channel == "myell")
             ? false
             : !bot || !bot->IsInWorld();
+    std::string dropReason = botUnavailable
+        ? "speaker_unavailable" : "";
 
     ObjectGuid playerObjGuid =
         ObjectGuid::Create<HighGuid::Player>(
@@ -335,6 +548,16 @@ void DeliverPendingMessagesImpl()
     bool proximityLocal =
         ownerSubsystem == "proximity"
         && (channel == "say" || channel == "msay");
+    bool addressedPlayerSay =
+        (eventType == "proximity_player_say"
+            || eventType
+                == "proximity_player_conversation")
+        && HasNonEmptyJsonString(
+            eventExtraData, "addressed_name");
+    bool allowMountedProximityBot =
+        addressedPlayerSay
+        || eventType == "proximity_player_emote"
+        || eventType == "proximity_reply";
     float proximityRadius = static_cast<float>(
         std::max(
             sLLMChatterConfig->_proxChatterScanRadius,
@@ -357,13 +580,46 @@ void DeliverPendingMessagesImpl()
             bot = nullptr;
             anchorPlayer = nullptr;
             botUnavailable = true;
+            dropReason = "anchor_player_invalid";
         }
         else if (channel == "say"
             && !IsProximityPlayerbotEligible(
-                anchorPlayer, bot, proximityRadius))
+                anchorPlayer, bot, proximityRadius,
+                allowMountedProximityBot))
         {
             bot = nullptr;
             botUnavailable = true;
+            dropReason = "speaker_ineligible";
+        }
+    }
+
+    Unit* explicitAddressee = nullptr;
+    if (anchorPlayer && anchorPlayer->IsInWorld())
+    {
+        if (addresseePlayerGuid
+            == anchorPlayer->GetGUID().GetCounter())
+        {
+            explicitAddressee = anchorPlayer;
+        }
+        else if (addresseeNPCSpawnId)
+        {
+            explicitAddressee = FindCreatureBySpawnId(
+                anchorPlayer->GetMap(),
+                addresseeNPCSpawnId);
+        }
+        else if (addresseeBotGuid)
+        {
+            ObjectGuid addresseeGuid =
+                ObjectGuid::Create<HighGuid::Player>(
+                    addresseeBotGuid);
+            Player* addresseeBot =
+                ObjectAccessor::FindPlayer(addresseeGuid);
+            if (addresseeBot && addresseeBot->IsInWorld()
+                && addresseeBot->GetMap()
+                    == anchorPlayer->GetMap())
+            {
+                explicitAddressee = addresseeBot;
+            }
         }
     }
 
@@ -392,7 +648,16 @@ void DeliverPendingMessagesImpl()
             {
                 bool faced = false;
 
-                if (eventId > 0)
+                if (explicitAddressee
+                    && explicitAddressee != bot
+                    && explicitAddressee->IsAlive())
+                {
+                    bot->SetFacingToObject(
+                        explicitAddressee);
+                    faced = true;
+                }
+
+                if (!faced && eventId > 0)
                 {
                     QueryResult evRes =
                         CharacterDatabase.Query(
@@ -571,7 +836,57 @@ void DeliverPendingMessagesImpl()
             std::string processedMessage =
                 ConvertAllLinks(message);
 
-            if (channel == "party")
+            bool emoteOnly = processedMessage.empty()
+                && !emoteName.empty()
+                && (channel == "say"
+                    || (channel == "party"
+                        && bot->GetGroup()));
+            if (emoteOnly)
+            {
+                bool bgEmoteBlocked =
+                    (channel == "battleground"
+                        || (channel == "party"
+                            && bot->GetBattleground()))
+                    && !IsBGAllowedEmote(emoteName);
+                if (bgEmoteBlocked)
+                {
+                    botUnavailable = true;
+                    dropReason = "bg_emote_blocked";
+                }
+                else
+                {
+                    uint32 textEmoteId =
+                        GetTextEmoteId(emoteName);
+                    if (textEmoteId)
+                    {
+                        std::string emoteTargetName =
+                            explicitAddressee
+                                ? explicitAddressee->GetName()
+                                : (emoteTarget
+                                    ? emoteTarget->GetName()
+                                    : "");
+                        if (emoteName == "talk"
+                            && emoteTargetName.empty())
+                        {
+                            PlayUnitTextEmoteAnimation(
+                                bot, textEmoteId);
+                        }
+                        else
+                        {
+                            SendBotTextEmote(
+                                bot, textEmoteId,
+                                emoteTargetName);
+                        }
+                        sent = true;
+                    }
+                    else
+                    {
+                        botUnavailable = true;
+                        dropReason = "invalid_emote";
+                    }
+                }
+            }
+            else if (channel == "party")
             {
                 Group* grp = bot->GetGroup();
                 if (grp && grp->isRaidGroup())
@@ -753,6 +1068,7 @@ void DeliverPendingMessagesImpl()
             }
 
             if (sent
+                && !emoteOnly
                 && !emoteName.empty()
                 && channel != "general"
                 && channel != "yell")
@@ -768,9 +1084,11 @@ void DeliverPendingMessagesImpl()
                     if (textEmoteId)
                     {
                         std::string emoteTargetName =
-                            emoteTarget
-                                ? emoteTarget->GetName()
-                                : "";
+                            explicitAddressee
+                                ? explicitAddressee->GetName()
+                                : (emoteTarget
+                                    ? emoteTarget->GetName()
+                                    : "");
                         if (emoteName == "talk"
                             && emoteTargetName.empty())
                         {
@@ -799,17 +1117,47 @@ void DeliverPendingMessagesImpl()
                 anchorPlayer, speaker,
                 proximityRadius);
         if (speakerUnavailable)
+        {
             botUnavailable = true;
+            dropReason = "npc_speaker_unavailable";
+        }
         else
         {
             float originalOrientation =
                 speaker->GetOrientation();
+            SceneFacingKey facingKey = {
+                eventId, npcSpawnId,
+            };
             bool facingApplied = false;
             if (sLLMChatterConfig->_facingEnable
                 && IsSafeForChatterFacing(speaker))
             {
+                if (eventId
+                    && sLLMChatterConfig
+                        ->_proxChatterFacingResetDelay > 0)
+                {
+                    auto inserted =
+                        _sceneOriginalFacings.emplace(
+                            facingKey,
+                            SceneFacingState{
+                                originalOrientation,
+                                now,
+                                playerGuid});
+                    originalOrientation = inserted.first
+                        ->second.orientation;
+                    inserted.first->second.updatedAt = now;
+                }
                 bool faced = false;
-                if (sequence > 0 && eventId > 0)
+                if (explicitAddressee
+                    && explicitAddressee != speaker
+                    && explicitAddressee->IsAlive())
+                {
+                    speaker->SetFacingToObject(
+                        explicitAddressee);
+                    faced = true;
+                    facingApplied = true;
+                }
+                if (!faced && sequence > 0 && eventId > 0)
                 {
                     QueryResult prevRes =
                         CharacterDatabase.Query(
@@ -876,34 +1224,71 @@ void DeliverPendingMessagesImpl()
             }
             std::string msayMessage =
                 ConvertAllLinks(message);
-            speaker->Say(
-                msayMessage, LANG_UNIVERSAL);
-            sent = true;
+            bool msayEmoteOnly =
+                msayMessage.empty()
+                && !emoteName.empty();
+            if (!msayMessage.empty())
+            {
+                speaker->Say(
+                    msayMessage, LANG_UNIVERSAL);
+                sent = true;
+            }
 
             if (!emoteName.empty())
             {
                 uint32 textEmoteId =
                     GetTextEmoteId(emoteName);
                 if (textEmoteId)
+                {
+                    std::string targetName =
+                        explicitAddressee
+                            ? explicitAddressee->GetName()
+                            : anchorPlayer->GetName();
                     SendUnitTextEmote(
                         speaker, textEmoteId,
-                        anchorPlayer->GetName());
+                        targetName);
+                    sent = true;
+                }
+                else if (msayEmoteOnly)
+                {
+                    botUnavailable = true;
+                    dropReason = "invalid_emote";
+                }
             }
 
-            if (facingApplied
-                && sLLMChatterConfig
-                    ->_proxChatterFacingResetDelay
-                > 0)
+            if (sLLMChatterConfig
+                    ->_proxChatterFacingResetDelay > 0)
             {
-                speaker->m_Events.AddEvent(
-                    new DelayedNPCFacingResetEvent(
-                        playerObjGuid,
-                        npcSpawnId,
-                        originalOrientation),
-                    speaker->m_Events.CalculateTime(
+                bool hasLaterLine = false;
+                if (eventId)
+                {
+                    QueryResult laterLine =
+                        CharacterDatabase.Query(
+                        "SELECT 1 FROM llm_chatter_messages "
+                        "WHERE event_id = {} AND sequence > {} "
+                        "AND delivered = 0 LIMIT 1",
+                        eventId, sequence);
+                    hasLaterLine = static_cast<bool>(laterLine);
+                }
+                if (!hasLaterLine && eventId)
+                {
+                    ScheduleSceneFacingResets(
+                        eventId,
                         sLLMChatterConfig
-                                ->_proxChatterFacingResetDelay
-                            * IN_MILLISECONDS));
+                            ->_proxChatterFacingResetDelay);
+                }
+                else if (!hasLaterLine && facingApplied)
+                {
+                    speaker->m_Events.AddEvent(
+                        new DelayedNPCFacingResetEvent(
+                            playerObjGuid,
+                            npcSpawnId,
+                            originalOrientation),
+                        speaker->m_Events.CalculateTime(
+                            sLLMChatterConfig
+                                    ->_proxChatterFacingResetDelay
+                                * IN_MILLISECONDS));
+                }
             }
         }
     }
@@ -936,6 +1321,7 @@ void DeliverPendingMessagesImpl()
         if (speakerUnavailable)
         {
             botUnavailable = true;
+            dropReason = "boss_speaker_unavailable";
         }
         else
         {
@@ -961,6 +1347,13 @@ void DeliverPendingMessagesImpl()
         if (pendingRes)
             replyEligible = false;
 
+        std::string deliveredContext = message;
+        if (deliveredContext.empty()
+            && !emoteName.empty())
+        {
+            deliveredContext = std::string(
+                "[performed /") + emoteName + "]";
+        }
         RecordDeliveredProximityLine(
             eventId,
             playerGuid,
@@ -971,7 +1364,7 @@ void DeliverPendingMessagesImpl()
             channel == "msay" ? npcSpawnId : 0,
             replyEligible,
             botName,
-            message);
+            deliveredContext);
     }
 
     if (sent && channel == "party")
@@ -1001,14 +1394,24 @@ void DeliverPendingMessagesImpl()
             message);
     }
 
-    if (sent || botUnavailable)
+    if (sent)
     {
         CharacterDatabase.DirectExecute(
             "UPDATE llm_chatter_messages "
             "SET delivered = 1, "
-            "delivered_at = NOW() "
+            "delivered_at = NOW(), "
+            "drop_reason = NULL "
             "WHERE id = {}",
             messageId);
+    }
+    else if (botUnavailable)
+    {
+        FinalizeDroppedMessage(
+            messageId, eventId, sequence,
+            eventType,
+            dropReason.empty()
+                ? "speaker_unavailable"
+                : dropReason.c_str());
     }
     else
     {
@@ -1016,6 +1419,7 @@ void DeliverPendingMessagesImpl()
         CharacterDatabase.DirectExecute(
             "UPDATE llm_chatter_messages "
             "SET delivered = 0, "
+            "drop_reason = NULL, "
             "deliver_at = DATE_ADD("
             "NOW(), INTERVAL 5 SECOND) "
             "WHERE id = {}",

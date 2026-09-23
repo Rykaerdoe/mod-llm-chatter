@@ -35,9 +35,6 @@ from chatter_constants import (
     DEFAULT_GOOGLE_MODEL,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_OPENROUTER_MODEL,
-    MSG_TYPE_PLAIN, MSG_TYPE_QUEST,
-    MSG_TYPE_LOOT, MSG_TYPE_QUEST_REWARD,
-    MSG_TYPE_TRADE, MSG_TYPE_SPELL,
     GOOGLE_OPENAI_BASE_URL,
     OPENROUTER_BASE_URL,
 )
@@ -88,6 +85,8 @@ from chatter_event_registry import (
     build_handler_map,
     validate_registry,
 )
+from llm_compat import describe_model_compatibility
+from chatter_llm import compatible_reasoning_effort
 
 # Configure logging
 logging.basicConfig(
@@ -1412,13 +1411,21 @@ def main():
     logger.info(
         f"Model: {model}"
     )
+    if provider in (
+        'openai', 'google', 'openrouter', 'ollama'
+    ):
+        logger.info(
+            "Model compatibility: %s",
+            describe_model_compatibility(
+                provider,
+                model,
+                compatible_reasoning_effort(provider, config),
+            ),
+        )
     if provider == 'ollama':
         base_url = config.get(
             'LLMChatter.Ollama.BaseUrl',
             'http://localhost:11434'
-        )
-        context_size = config.get(
-            'LLMChatter.Ollama.ContextSize', 2048
         )
         disable_thinking = (
             config.get(
@@ -1427,10 +1434,9 @@ def main():
             ) == '1'
         )
         logger.info(f"Ollama URL: {base_url}")
-        logger.info(f"Context size: {context_size}")
         logger.info(
             f"Thinking mode: "
-            f"{'disabled (/no_think)' if disable_thinking else 'enabled'}"
+            f"{'disabled' if disable_thinking else 'enabled'}"
         )
     logger.info(f"Poll interval: {poll_interval}s")
     logger.info(
@@ -1452,17 +1458,6 @@ def main():
         f"Event system: "
         f"{'enabled' if use_event_system else 'disabled'}"
     )
-    logger.info(
-        f"Message type distribution: "
-        f"{MSG_TYPE_PLAIN}% plain, "
-        f"{MSG_TYPE_QUEST - MSG_TYPE_PLAIN}% quest, "
-        f"{MSG_TYPE_LOOT - MSG_TYPE_QUEST}% loot, "
-        f"{MSG_TYPE_QUEST_REWARD - MSG_TYPE_LOOT}% "
-        f"quest+reward, "
-        f"{MSG_TYPE_TRADE - MSG_TYPE_QUEST_REWARD}% "
-        f"trade, "
-        f"{MSG_TYPE_SPELL - MSG_TYPE_TRADE}% spell"
-    )
     precache_enabled = config.get(
         'LLMChatter.GroupChatter.PreCacheEnable',
         '1'
@@ -1482,8 +1477,6 @@ def main():
     logger.info(
         f"  Ollama.BaseUrl: "
         f"{config.get('LLMChatter.Ollama.BaseUrl', 'http://localhost:11434')}"
-        f"  ContextSize: "
-        f"{config.get('LLMChatter.Ollama.ContextSize', 2048)}"
         f"  DisableThinking: "
         f"{config.get('LLMChatter.Ollama.DisableThinking', 1)}"
     )
@@ -1610,11 +1603,11 @@ def main():
     logger.info("General chat:")
     logger.info(
         f"  ReactionChance: "
-        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 40)}%"
+        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 100)}%"
         f"  QuestionChance: "
-        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 80)}%"
+        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 100)}%"
         f"  Cooldown: "
-        f"{config.get('LLMChatter.GeneralChat.Cooldown', 30)}s"
+        f"{config.get('LLMChatter.GeneralChat.Cooldown', 0)}s"
     )
     logger.info("-" * 60)
     logger.info("Guild chatter:")
@@ -1804,8 +1797,6 @@ def main():
     logger.info(
         f"  EventExpiration: "
         f"{config.get('LLMChatter.EventExpirationSeconds', 600)}s"
-        f"  LootRecentCooldown: "
-        f"{config.get('LLMChatter.LootRecentCooldownSeconds', 1200)}s"
     )
     logger.info(
         f"  BGChatter.MaxTokens: "

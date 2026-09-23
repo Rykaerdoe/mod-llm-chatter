@@ -6,8 +6,10 @@
 #include "LLMChatterConfig.h"
 #include "Config.h"
 #include "Log.h"
+#include "SharedDefines.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <limits>
 #include <memory>
@@ -20,6 +22,13 @@ template <typename T>
 T GetChatterOption(std::string const& name, T const& def)
 {
     return sConfigMgr->GetOption<T>(name, def, false);
+}
+
+char ToLowerAscii(unsigned char value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return static_cast<char>(value + ('a' - 'A'));
+    return static_cast<char>(value);
 }
 
 std::unordered_set<uint32> ParseCreatureEntrySet(
@@ -83,12 +92,126 @@ std::unordered_set<uint32> ParseCreatureEntrySet(
     return entries;
 }
 
+template <size_t Size>
+std::array<uint32, Size> ParseDirectedReactorWeights(
+    std::string const& configured,
+    std::array<uint32, Size> const& defaults,
+    char const* optionName,
+    char const* defaultText)
+{
+    std::array<uint32, Size> weights = {};
+    std::istringstream input(configured);
+    std::string token;
+    size_t index = 0;
+    bool valid = true;
+
+    while (std::getline(input, token, ','))
+    {
+        if (index >= weights.size())
+        {
+            valid = false;
+            break;
+        }
+
+        token.erase(
+            token.begin(),
+            std::find_if_not(
+                token.begin(), token.end(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }));
+        token.erase(
+            std::find_if_not(
+                token.rbegin(), token.rend(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }).base(),
+            token.end());
+
+        try
+        {
+            size_t parsed = 0;
+            unsigned long value = std::stoul(token, &parsed);
+            if (parsed != token.size() || value > 100)
+            {
+                valid = false;
+                break;
+            }
+            weights[index++] = static_cast<uint32>(value);
+        }
+        catch (...)
+        {
+            valid = false;
+            break;
+        }
+    }
+
+    uint32 total = 0;
+    bool descending = valid && index == weights.size();
+    for (size_t i = 0; i < weights.size(); ++i)
+    {
+        total += weights[i];
+        if (i > 0 && weights[i - 1] <= weights[i])
+            descending = false;
+    }
+    descending = descending && total == 100;
+    if (!descending)
+    {
+        LOG_WARN(
+            "module",
+            "LLMChatter: {} must contain {} strictly descending "
+            "percentages totaling 100; using {}",
+            optionName, weights.size(), defaultText);
+        return defaults;
+    }
+
+    return weights;
+}
+
+std::unordered_set<std::string> ParseLowerWordSet(
+    std::string const& configured)
+{
+    std::unordered_set<std::string> words;
+    std::istringstream input(configured);
+    std::string token;
+    while (std::getline(input, token, ','))
+    {
+        token.erase(
+            token.begin(),
+            std::find_if_not(
+                token.begin(), token.end(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }));
+        token.erase(
+            std::find_if_not(
+                token.rbegin(), token.rend(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }).base(),
+            token.end());
+        std::transform(
+            token.begin(), token.end(), token.begin(),
+            [](unsigned char value)
+            {
+                return static_cast<char>(std::tolower(value));
+            });
+        if (!token.empty())
+            words.insert(token);
+    }
+    return words;
+}
+
 bool ContainsCreatureEntry(
-    std::atomic<std::shared_ptr<
-        std::unordered_set<uint32> const>> const& configured,
+    std::shared_ptr<std::unordered_set<uint32> const> const& configured,
     uint32 creatureEntry)
 {
-    auto entries = configured.load();
+    // GCC 11 supports shared_ptr atomic functions, but not atomic<shared_ptr>.
+    auto entries = std::atomic_load(&configured);
     return creatureEntry > 0 && entries
         && entries->count(creatureEntry) > 0;
 }
@@ -115,6 +238,60 @@ bool LLMChatterConfig::IsProximityBossSpeakerDenied(
         _proxBossSpeakerDenyEntries, creatureEntry);
 }
 
+bool LLMChatterConfig::IsDirectedNameStopword(
+    std::string const& word) const
+{
+    auto words = std::atomic_load(
+        &_proxDirectedNameStopwords);
+    return words && words->count(word) > 0;
+}
+
+bool LLMChatterConfig::IsCxxScriptedEmoteEntry(
+    uint32 creatureEntry) const
+{
+    return ContainsCreatureEntry(
+        _emoteCxxScriptExclusionEntries,
+        creatureEntry);
+}
+
+bool LLMChatterConfig::IsPlayerChatPrefixIgnored(
+    std::string const& message) const
+{
+    auto prefixes = std::atomic_load(
+        &_playerChatIgnoredPrefixes);
+    if (!prefixes || prefixes->empty())
+        return false;
+
+    size_t start = message.find_first_not_of(
+        " \t\n\r\f\v");
+    if (start == std::string::npos)
+        return false;
+
+    for (std::string const& prefix : *prefixes)
+    {
+        if (message.size() - start < prefix.size())
+            continue;
+
+        bool matches = true;
+        for (size_t index = 0;
+             index < prefix.size(); ++index)
+        {
+            unsigned char value = static_cast<unsigned char>(
+                message[start + index]);
+            if (ToLowerAscii(value) != prefix[index])
+            {
+                matches = false;
+                break;
+            }
+        }
+
+        if (matches)
+            return true;
+    }
+
+    return false;
+}
+
 void LLMChatterConfig::LoadConfig()
 {
     _enabled = GetChatterOption<bool>("LLMChatter.Enable", false);
@@ -125,12 +302,29 @@ void LLMChatterConfig::LoadConfig()
     _conversationChance = GetChatterOption<uint32>(
         "LLMChatter.ConversationChance", 40);
     _triggerChance = GetChatterOption<uint32>("LLMChatter.TriggerChance", 15);
+    _ambientNpcGossipChance = GetChatterOption<uint32>(
+        "LLMChatter.AmbientNpcGossipChance", 5);
+    _ambientBotGossipChance = GetChatterOption<uint32>(
+        "LLMChatter.AmbientBotGossipChance", 5);
+    _ambientTradeQualityWeightBonus = std::min<uint32>(
+        GetChatterOption<uint32>(
+            "LLMChatter.AmbientTrade.QualityWeightBonus", 4),
+        100);
     _cityChatterMultiplier = GetChatterOption<uint32>("LLMChatter.CityChatterMultiplier", 2);
     _maxPendingRequests = GetChatterOption<uint32>("LLMChatter.MaxPendingRequests", 5);
     _maxBotsPerZone = GetChatterOption<uint32>(
         "LLMChatter.MaxBotsPerZone", 8);
     _maxMessageLength = GetChatterOption<uint32>(
         "LLMChatter.MaxMessageLength", 250);
+    std::string playerChatIgnoredPrefixes =
+        GetChatterOption<std::string>(
+            "LLMChatter.PlayerChat.IgnoredPrefixes", "");
+    auto parsedPlayerChatIgnoredPrefixes =
+        std::make_shared<std::unordered_set<std::string> const>(
+            ParseLowerWordSet(playerChatIgnoredPrefixes));
+    std::atomic_store(
+        &_playerChatIgnoredPrefixes,
+        std::move(parsedPlayerChatIgnoredPrefixes));
 
     // Delivery settings
     _deliveryPollMs = GetChatterOption<uint32>("LLMChatter.DeliveryPollMs", 1000);
@@ -301,7 +495,7 @@ void LLMChatterConfig::LoadConfig()
     _groupKillCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.KillCooldown", 120);
     _groupDeathCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.DeathCooldown", 30);
     _groupLootCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.LootCooldown", 60);
-    _groupPlayerMsgCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.PlayerMsgCooldown", 15);
+    _groupPlayerMsgCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.PlayerMsgCooldown", 0);
 
     // Group chatter - new event settings
     _groupResurrectChance = GetChatterOption<uint32>("LLMChatter.GroupChatter.ResurrectChance", 100);
@@ -596,17 +790,34 @@ void LLMChatterConfig::LoadConfig()
     _useGeneralChatReact = GetChatterOption<bool>(
         "LLMChatter.GeneralChat.PlayerReplyEnable", true);
     _generalChatChance = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.ReactionChance", 40);
+        "LLMChatter.GeneralChat.ReactionChance", 100);
     _generalChatQuestionChance = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.QuestionChance", 80);
+        "LLMChatter.GeneralChat.QuestionChance", 100);
     _generalChatCooldown = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.Cooldown", 30);
+        "LLMChatter.GeneralChat.Cooldown", 0);
     _generalChatConversationChance = GetChatterOption<uint32>(
         "LLMChatter.GeneralChat.ConversationChance", 30);
     _generalChatHistoryLimit =
         GetChatterOption<uint32>(
             "LLMChatter.GeneralChat.HistoryLimit",
             15);
+
+    _generalLootEnable = GetChatterOption<bool>(
+        "LLMChatter.GeneralLoot.Enable", true);
+    _generalLootAggregationDelayMs = std::max<uint32>(
+        100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot."
+            "AggregationDelayMilliseconds",
+            2500));
+    _generalLootZoneCooldownSeconds =
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot.ZoneCooldownSeconds",
+            180);
+    _generalLootMinQuality = std::min<uint32>(
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot.MinQuality", 2),
+        MAX_ITEM_QUALITY - 1);
 
     // RP enrichment
     _raceLoreChance = GetChatterOption<uint32>("LLMChatter.RaceLoreChance", 20);
@@ -710,7 +921,7 @@ void LLMChatterConfig::LoadConfig()
         std::min(
             GetChatterOption<uint32>(
                 "LLMChatter.GuildChatter."
-                "PlayerReplies.DebounceSeconds", 2),
+                "PlayerReplies.DebounceSeconds", 1),
             10u);
     _guildPlayerIdleSuppressionSeconds =
         GetChatterOption<uint32>(
@@ -829,9 +1040,11 @@ void LLMChatterConfig::LoadConfig()
             "LLMChatter.ProximityChatter."
             "InstanceChance", _proxChatterChance);
     _proxChatterEntityCooldown =
-        GetChatterOption<uint32>(
-            "LLMChatter.ProximityChatter."
-            "EntityCooldown", 60);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "EntityCooldown", 1),
+            3u);
     _proxChatterZoneFatigueThreshold =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -872,6 +1085,70 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
             "FacingResetDelay", 8);
+    _proxDirectedMaxExtraReactors =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedMaxExtraReactors", 2),
+            2u);
+    _proxDirectedBotMaxParticipants =
+        std::clamp(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedBotMaxParticipants", 3),
+            1u, 3u);
+    _proxDirectedExtraReactorWeights =
+        ParseDirectedReactorWeights(
+            GetChatterOption<std::string>(
+                "LLMChatter.ProximityChatter."
+                "DirectedExtraReactorWeights",
+                "60,30,10,0"),
+            std::array<uint32, 4>{60, 30, 10, 0},
+            "DirectedExtraReactorWeights",
+            "60,30,10,0");
+    _proxDirectedWitnessReactorWeights =
+        ParseDirectedReactorWeights(
+            GetChatterOption<std::string>(
+                "LLMChatter.ProximityChatter."
+                "DirectedWitnessReactorWeights",
+                "70,30"),
+            std::array<uint32, 2>{70, 30},
+            "DirectedWitnessReactorWeights",
+            "70,30");
+    _proxDirectedNPCAsideChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedNPCAsideChance", 35),
+            100u);
+    _proxDirectedMaxLines =
+        std::min(
+            8u,
+            std::max(
+                1u,
+                GetChatterOption<uint32>(
+                    "LLMChatter.ProximityChatter."
+                    "DirectedMaxLines", 5)));
+    _proxDirectedExpirySeconds =
+        std::max(
+            1u,
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedExpirySeconds", 30));
+    std::string directedNameStopwords =
+        GetChatterOption<std::string>(
+            "LLMChatter.ProximityChatter."
+            "DirectedNameStopwords",
+            "guard,city,mountaineer,innkeeper,vendor,trainer,"
+            "quartermaster,merchant,stablemaster,banker,auctioneer,"
+            "flight,master,officer,captain,stormwind,ironforge,"
+            "orgrimmar,darnassus,undercity,silvermoon,exodar");
+    auto parsedDirectedNameStopwords =
+        std::make_shared<std::unordered_set<std::string> const>(
+            ParseLowerWordSet(directedNameStopwords));
+    std::atomic_store(
+        &_proxDirectedNameStopwords,
+        std::move(parsedDirectedNameStopwords));
     std::string speakerAllowEntries =
         GetChatterOption<std::string>(
             "LLMChatter.ProximityChatter."
@@ -881,7 +1158,7 @@ void LLMChatterConfig::LoadConfig()
             ParseCreatureEntrySet(
                 speakerAllowEntries,
                 "SpeakerAllowEntries"));
-    _proxSpeakerAllowEntries.store(
+    std::atomic_store(&_proxSpeakerAllowEntries,
         std::move(parsedSpeakerAllowEntries));
     std::string speakerDenyEntries =
         GetChatterOption<std::string>(
@@ -892,7 +1169,7 @@ void LLMChatterConfig::LoadConfig()
             ParseCreatureEntrySet(
                 speakerDenyEntries,
                 "SpeakerDenyEntries"));
-    _proxSpeakerDenyEntries.store(
+    std::atomic_store(&_proxSpeakerDenyEntries,
         std::move(parsedSpeakerDenyEntries));
     _proxBossDialogueEnable =
         GetChatterOption<bool>(
@@ -951,9 +1228,11 @@ void LLMChatterConfig::LoadConfig()
             "LLMChatter.ProximityChatter."
             "BossPresenceResetSeconds", 90);
     _proxBossDirectedReplyCooldown =
-        GetChatterOption<uint32>(
-            "LLMChatter.ProximityChatter."
-            "BossDirectedReplyCooldownSeconds", 15);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "BossDirectedReplyCooldownSeconds", 1),
+            3u);
     _proxBossDirectedScanCooldown =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -967,7 +1246,7 @@ void LLMChatterConfig::LoadConfig()
             ParseCreatureEntrySet(
                 bossSpeakerDenyEntries,
                 "BossSpeakerDenyEntries"));
-    _proxBossSpeakerDenyEntries.store(
+    std::atomic_store(&_proxBossSpeakerDenyEntries,
         std::move(parsedBossSpeakerDenyEntries));
 
     // Emote reaction system
@@ -976,21 +1255,45 @@ void LLMChatterConfig::LoadConfig()
             "LLMChatter.EmoteReactions.Enable",
             true);
     _emoteMirrorChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "MirrorChance", 90);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "MirrorChance", 80),
+            100u);
     _emoteMirrorCooldown =
         GetChatterOption<uint32>(
             "LLMChatter.EmoteReactions."
             "MirrorCooldown", 15);
     _emoteReactionChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "ReactionChance", 60);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "ReactionChance", 80),
+            100u);
+    _emoteUngroupedBotMirrorChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotMirrorChance", 80),
+            100u);
+    _emoteUngroupedBotVerbalReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotVerbalReactionChance", 80),
+            100u);
+    _emoteUngroupedBotWitnessReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotWitnessReactionChance", 50),
+            100u);
     _emoteObserverChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "ObserverChance", 40);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "ObserverChance", 50),
+            100u);
     _emoteObserverCooldown =
         GetChatterOption<uint32>(
             "LLMChatter.EmoteReactions."
@@ -1003,5 +1306,30 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<bool>(
             "LLMChatter.EmoteReactions."
             "NPCMirrorEnable", true);
+    _emoteNPCVerbalReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "NPCVerbalReactionChance", 80),
+            100u);
+    _emoteNPCVerbalCooldown =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "NPCVerbalCooldown", 3),
+            3u);
+    std::string cxxScriptExclusionEntries =
+        GetChatterOption<std::string>(
+            "LLMChatter.EmoteReactions."
+            "CxxScriptExclusionEntries",
+            "620,25305,33211,33224,6626,7233,3401");
+    auto parsedCxxScriptExclusionEntries =
+        std::make_shared<std::unordered_set<uint32> const>(
+            ParseCreatureEntrySet(
+                cxxScriptExclusionEntries,
+                "CxxScriptExclusionEntries"));
+    std::atomic_store(
+        &_emoteCxxScriptExclusionEntries,
+        std::move(parsedCxxScriptExclusionEntries));
 
 }

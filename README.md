@@ -32,23 +32,28 @@ Built from the ground up for **fantasy roleplay immersion**. Every system, perso
 
 ## Features
 
-* **Roleplay-First Personalities**: Every bot is a distinct character in Azeroth's story. Their dialogue is deeply rooted in their race, class, and assigned personality traits, dynamically enhanced by their specialized talent builds. Bots stay in character, a Forsaken warlock speaks nothing like a Draenei paladin, and both draw from the lore and culture of their people to feel like living, breathing inhabitants of the world.
-* **Persistent Personality & Memories**: Your companions remember you. Each bot carries a unique, permanent personality. Every dungeon you clear together, every boss you defeat, every achievement you earn, every level milestone, all of it is written into that bot's memory as a personal journal entry. The next time you group up, they might reference that time you wiped in Shadowfang Keep, or fondly recall discovering a hidden corner of Teldrassil together. Your relationship with each companion deepens over time, building the kind of shared history that makes a party of adventurers feel like old friends reunited at an inn.
-* **Background Stories**: Every bot has an origin. When a companion first joins your group, the LLM generates a short background story rooted in their race, class, and personality traits — where they were born, who raised them, and the events that shaped who they are. A blood elf mage might carry the scars of Silvermoon's fall; a dwarf warrior might have learned to fight in the pits beneath Ironforge. These backstories are persistent, surviving across sessions, and are occasionally woven into idle chatter and ambient dialogue, giving bots a subtle sense of personal history without ever breaking the flow of conversation. View and regenerate backstories anytime through the Chatter Companion addon.
-* **Deep Spatial & Lore Awareness**: Bots possess an intimate understanding of their surroundings, maintaining full awareness of both the broader world zones and the specific subzones within them. Whether you are wandering the vibrant paths of Elwynn Forest, traversing the vast snows of Dragonblight, or delving into the ancient mysteries of the Ruins of Mathystra in Darkshore, bots draw from over 3,000 unique descriptions to comment on the history, magic, and atmosphere of your exact location. In cities, they notice when you enter a new district, walking into the Cenarion Enclave or Krasus' Landing prompts a natural comment about the surroundings.
-* **Conscious World Sensing**: The world is alive, and your companions notice it. Bots dynamically react to everything in their vicinity, from wildlife and rare creatures to NPCs, ancient ruins, weathered statues, and eerie altars. They also observe functional points of interest like moonwells, crackling fireplaces, and bustling forges, while adapting to weather changes, the time of day, arriving zeppelins, and seasonal holidays.
-* **Organic Party Interactivity**: Your companions don't just follow; they interact. They will strike up multi-bot conversations, ask you unprompted questions about your journey, and react authentically to combat, loot, and quest milestones. Seamlessly integrated with the game's emote and voice systems, bots punctuate their dialogue with physical gestures and audible character voices, bringing an extra layer of life to everything from the thrill of an achievement to quiet banter by the campfire.
-* **A Living, Breathing World**: The immersion extends beyond your immediate party. The open world's General channel hums with ambient bot chatter, reacting to real player messages and world events. Guards, vendors, trainers, and citizens engage in proximity `/say` conversations as you walk past, your party bots join in too, slipping naturally between party chat and the world around them. In battlegrounds, bots shout tactical callouts rooted in faction pride, while in raids, they brace for encounters across 148 iconic bosses, sharing lore and rallying morale between pulls.
-* **Guild Hall Camaraderie**: Beyond the party and the open world,
-  your guild feels like a real group of adventurers instead of a silent
-  roster. Guildmates share stories, trade jokes, voice their opinions,
-  and fall into conversations of their own. Speak in Guild Chat and
-  they answer as familiar companions, remembering what has been said
-  and carrying shared threads forward naturally. When you return to
-  Azeroth, a warm welcome from your guild helps make the channel feel
-  like a community that was already alive before you arrived.
-* **Seamless Fantasy Immersion**: Designed to preserve the roleplay atmosphere, the module features smart pacing, multi-character conversation flow, and natural reading delays. No repetitive robotic spam, no fourth-wall breaks, just natural, in-character dialogue that deepens the fantasy of adventuring through Azeroth.
-* **Zero Server Impact**: All LLM processing runs in a separate bridge service with a thread-pool worker model. The game server simply drops event rows into the database and moves on, never waiting on an API call. Responses flow back through the same queue and are delivered on the next world tick, keeping your server performance completely unaffected.
+* **Roleplay-first characters**: Bots speak as distinct inhabitants of
+  Azeroth, shaped by race, class, talents, personality, and lore. Natural
+  pacing, multi-character flow, emotes, and voices keep conversations
+  immersive.
+* **Persistent personalities and histories**: Each companion keeps a stable
+  identity, generated backstory, and memories of shared dungeons, bosses,
+  achievements, and milestones. Backstories can be viewed or regenerated
+  through the Chatter Companion addon.
+* **Location and world awareness**: More than 3,000 zone and subzone
+  descriptions ground dialogue in the surrounding lore. Bots notice nearby
+  creatures, NPCs, objects, points of interest, weather, time, transports,
+  and holidays.
+* **Interactive parties**: Companions banter with one another, ask the player
+  questions, and react to combat, loot, quests, achievements, and travel.
+* **Living public channels**: Ambient General chat, proximity `/say`, player
+  replies, battleground callouts, and encounter-aware raid dialogue make the
+  wider world feel populated.
+* **Social guild chat**: Guildmates greet returning players, answer messages,
+  hold conversations, and carry shared context forward during a session.
+* **Non-blocking architecture**: LLM work runs in a separate, concurrent
+  bridge service. Worldserver queues events and delivers completed responses
+  without waiting on provider calls.
 
 ---
 
@@ -56,7 +61,8 @@ Built from the ground up for **fantasy roleplay immersion**. Every system, perso
 
 1. Clone into `modules/` and build AzerothCore
 2. Copy `conf/mod_llm_chatter.conf.dist` to your config directory and name it `mod_llm_chatter.conf`
-3. Set your LLM provider and the matching API key (`LLMChatter.Anthropic.ApiKey`, `LLMChatter.OpenAI.ApiKey`, `LLMChatter.Google.ApiKey`, `LLMChatter.OpenRouter.ApiKey`, or no key when using Ollama)
+3. Set `LLMChatter.Provider`, `LLMChatter.Model`, and the matching API
+   key (Ollama does not need a key)
 4. Start worldserver once, or run `dbimport`, so AzerothCore applies the module's character database schema
 5. Start the Python bridge
 6. Play, bots start chatting when grouped with players
@@ -86,6 +92,8 @@ packages individually can bypass the module's compatibility constraints.
 
 Tested extensively with excellent results:
 - **Claude Haiku 4.5** (Anthropic),  fast, affordable, excellent quality
+- **GPT-5.6 Luna** (OpenAI), fast and inexpensive; use
+  `LLMChatter.OpenAI.ReasoningEffort = none` for short-form chatter
 - **GPT-4o-mini** (OpenAI),  great alternative, similar cost
 - **Gemini 3.1 Flash-Lite** (Google),  fast, cheap, tested with
   structured chatter and pre-cache JSON
@@ -97,13 +105,115 @@ Tested extensively with excellent results:
   `openai/gpt-4o-mini`, and `openai/gpt-4.1-mini`, useful when users
   want OpenRouter routing while keeping OpenAI-compatible calls
 
-Ollama is supported for local/free inference, but the module's advanced prompt architecture (structured JSON responses, system/user message separation, emote and action fields) demands strong instruction-following capabilities that smaller open-source models may not consistently deliver. For the best experience, we recommend Claude Haiku, GPT-4o-mini, GPT-4.1-mini, Gemini 3.1 Flash-Lite, or equivalent fast OpenRouter-hosted models such as Claude Haiku 4.5, GPT-4o-mini, or GPT-4.1-mini. See the config file header for provider setup details.
+Ollama is supported for local/free inference, but the module's structured
+JSON, system/user messages, emotes, and actions demand strong instruction
+following. Smaller open-source models may not deliver it consistently. For
+the best experience, use Claude Haiku, GPT-5.6 Luna, GPT-4o-mini,
+GPT-4.1-mini, Gemini 3.1 Flash-Lite, or an equivalent fast model through
+OpenRouter. See the config header for more provider guidance.
+
+### Provider and Model Setup
+
+Configuration uses unquoted `Key = value` lines. Copy model IDs exactly:
+direct-provider IDs look like `gpt-5.6-luna`, OpenRouter IDs use
+`vendor/model`, and Ollama IDs use the name and tag shown by `ollama list`.
+Leave an optional value empty after `=`. Keep comments on separate lines;
+the chatter parser treats an inline comment as part of the value.
+
+| Provider | Provider value | Model setting | Credential |
+|----------|----------------|---------------|------------|
+| Anthropic | `anthropic` | Exact Anthropic model ID | `LLMChatter.Anthropic.ApiKey` |
+| OpenAI | `openai` | Exact OpenAI API model ID | `LLMChatter.OpenAI.ApiKey` |
+| Google | `google` | Exact Gemini API model ID | `LLMChatter.Google.ApiKey` |
+| OpenRouter | `openrouter` | A `vendor/model` slug | `LLMChatter.OpenRouter.ApiKey` |
+| Ollama | `ollama` | A name/tag from `ollama list` | None |
+
+Ready-to-copy examples (replace only the placeholder key):
+
+```ini
+# Anthropic
+LLMChatter.Provider = anthropic
+LLMChatter.Model = claude-haiku-4-5-20251001
+LLMChatter.Anthropic.ApiKey = sk-ant-xxxxx
+
+# OpenAI Luna
+LLMChatter.Provider = openai
+LLMChatter.Model = gpt-5.6-luna
+LLMChatter.OpenAI.ApiKey = sk-xxxxx
+LLMChatter.OpenAI.ReasoningEffort = none
+LLMChatter.OpenAI.MaxTokensMultiplier = 4
+
+# Google Gemini
+LLMChatter.Provider = google
+LLMChatter.Model = gemini-3.1-flash-lite
+LLMChatter.Google.ApiKey = AIza-xxxxx
+
+# OpenRouter
+LLMChatter.Provider = openrouter
+LLMChatter.Model = anthropic/claude-haiku-4.5
+LLMChatter.OpenRouter.ApiKey = sk-or-v1-xxxxx
+
+# Local Ollama from a Docker bridge
+LLMChatter.Provider = ollama
+LLMChatter.Model = qwen3:8b
+LLMChatter.Ollama.BaseUrl = http://host.docker.internal:11434
+```
+
+Use only one provider recipe at a time. Existing credentials for inactive
+providers can remain in the file. Restart `ac-llm-chatter-bridge` after a
+provider or model change. The bridge chooses compatible token, temperature,
+and reasoning parameters automatically, then caches any explicit
+unsupported-parameter correction for the rest of that process.
+
+### Ignoring Visible Protocol Chat
+
+If a server-specific addon or command sends machine-readable data through
+visible player chat, Chatter can ignore it without blocking the message from
+the game's normal chat system:
+
+```ini
+LLMChatter.PlayerChat.IgnoredPrefixes = !addon:,.custom:
+```
+
+The comma-separated list applies to real-player Party, General, Guild, and
+`/say` input. Matching ignores leading whitespace and ASCII letter case and
+runs before Chatter stores history or queues LLM work. Use distinctive
+punctuation-bearing prefixes: configured entries are trimmed, and matching is
+literal rather than word-aware. Normal `SendAddonMessage` traffic already
+arrives as `LANG_ADDON` and does not need an entry. After the supporting C++
+version is installed, apply list changes with `.reload config`.
+
+For OpenAI Luna, `none` gives the lowest-latency behavior and permits the
+configured temperature. Higher reasoning efforts can consume more of the
+output budget, so the bridge applies `OpenAI.MaxTokensMultiplier` whenever
+hidden reasoning may be active. It omits temperature where the model does
+not support it. See the [official Luna model page](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
+
+For Ollama, run `ollama pull <model>` on the Ollama host first. A host-run
+bridge normally uses `http://localhost:11434`; a Docker bridge normally uses
+`http://host.docker.internal:11434`. Do not append `/v1` to the configured
+base URL.
+
+Ollama's OpenAI-compatible endpoint does not accept a per-request context
+size. Set `OLLAMA_CONTEXT_LENGTH` before starting Ollama, or create a custom
+model whose Modelfile contains `PARAMETER num_ctx 4096`. Confirm the loaded
+value in the `CONTEXT` column from `ollama ps`. `Ollama.DisableThinking = 1`
+uses both the supported `reasoning_effort = none` request and `/no_think`
+fallback for compatible local models.
 
 ### Tuning the Chattiness
 
 The default config ships on the **chatty side** so you can
 experience all the features out of the box. If you prefer a
 quieter, more immersive atmosphere, the key knobs are below.
+
+An optional lower-volume template is available at
+[`conf/presets/mod_ll_chatter_quieter.conf.dist`](conf/presets/mod_ll_chatter_quieter.conf.dist).
+It is not automatically installed or loaded. To use it, back up your active
+config, then copy the preset to your server's module-config directory as
+`mod_llm_chatter.conf` and configure its database and provider credentials.
+Keep alternate presets in `conf/presets/`: files directly under
+`conf/*.conf.dist` are registered as required config filenames at build time.
 
 **Reducing General channel chatter** (ambient bot conversations
 in zone-wide chat):
@@ -148,7 +258,11 @@ chance to `0` disables that trigger entirely. See the config
 file comments for the full list of tunable keys.
 
 ### Known Limitations
-- **Ollama / open-source models**: Local inference requires fast hardware (sub-5s responses). Models below 8B frequently produce malformed JSON, ignore length constraints, or echo prompt instructions. Cloud-hosted Ollama models vary in quality — reasoning models (deepseek, qwen3.5, glm) are incompatible. For reliable results, use Claude Haiku or GPT-4o-mini
+- **Ollama / open-source models**: Local inference needs fast hardware and
+  strong instruction following. Small or reasoning-heavy models can be slow,
+  return malformed JSON, or spend the output budget before producing visible
+  chat. Prefer an instruct/tool-capable 8B-or-larger model and enable
+  `LLMChatter.Ollama.DisableThinking` for compatible thinking models.
 - Ollama cloud models add routing overhead compared to direct Anthropic/OpenAI APIs
 
 ---
@@ -175,6 +289,8 @@ AiPlayerbot.RandomBotSayWithoutMaster = 0
 
 Copy `modules/mod-llm-chatter/conf/mod_llm_chatter.conf.dist` to `env/dist/etc/modules/` and rename it to `mod_llm_chatter.conf`. Open it in a text editor and set at minimum:
 - `LLMChatter.Provider`,  choose `anthropic`, `openai`, `google`, `openrouter`, or `ollama`
+- `LLMChatter.Model`, using the exact ID format shown in
+  [Provider and Model Setup](#provider-and-model-setup)
 - the matching provider API key, for example `LLMChatter.OpenRouter.ApiKey` when using OpenRouter (not needed for Ollama)
 
 **2. Add bridge to docker-compose.override.yml**
@@ -243,6 +359,8 @@ docker compose --profile dev up -d
 
 Copy `conf/mod_llm_chatter.conf.dist` to your server's config directory (typically `etc/modules/`) and rename it to `mod_llm_chatter.conf`. Open it in a text editor and set at minimum:
 - `LLMChatter.Provider`,  choose `anthropic`, `openai`, `google`, `openrouter`, or `ollama`
+- `LLMChatter.Model`, using the exact ID format shown in
+  [Provider and Model Setup](#provider-and-model-setup)
 - the matching provider API key, for example `LLMChatter.OpenRouter.ApiKey` when using OpenRouter (not needed for Ollama)
 
 **3. Initialize character tables**
@@ -352,6 +470,9 @@ LLMChatter.Screenshot.DBHost = 127.0.0.1
 ```
 
 Make sure your config also has the matching API key set (`LLMChatter.OpenAI.ApiKey`, `LLMChatter.Anthropic.ApiKey`, `LLMChatter.Google.ApiKey`, or `LLMChatter.OpenRouter.ApiKey`).
+The screenshot agent uses the same model-aware token-field negotiation as the
+bridge, so direct OpenAI reasoning/vision model IDs do not require a separate
+`max_tokens` workaround.
 
 **4. Restart the chatter bridge**
 
@@ -377,7 +498,7 @@ Make sure WoW is in the foreground (the agent only captures when WoW is the acti
 
 - The agent saves screenshots to `modules/mod-llm-chatter/logs/screenshots/` so you can see exactly what the AI is analyzing
 - If bots aren't saying anything, check that the agent terminal shows `Queued observation:` messages
-- Cost is roughly **$0.05-0.10 per hour** of play with GPT-4o-mini
+- Vision cost varies with the provider, model, image size, and current pricing
 - You can stop the agent at any time (Ctrl+C) — the rest of the module continues working normally
 
 ---
@@ -394,8 +515,34 @@ Make sure WoW is in the foreground (the agent only captures when WoW is the acti
 > started before worldserver.
 
 **Existing installs** must apply migration scripts manually
-when updating to a newer version. Migrations live in
-`data/sql/characters/updates/` and are named by date:
+when updating to a newer version. Migrations live under
+`data/sql/*/updates/` and are named by date.
+
+### Required spell override repair
+
+Installations that loaded the optional talent data before April 9, 2026
+must apply the following world-database migration. Older versions inserted
+incomplete `spell_dbc` overrides that could cause spell-script validation
+warnings and hide real client spell effects. The migration only removes
+rows that still match that legacy placeholder shape and is safe to rerun.
+
+```bash
+# Docker
+docker exec -i ac-database mysql -uroot -ppassword acore_world < \
+  modules/mod-llm-chatter/data/sql/world/updates/20260913_remove_legacy_spell_dbc_placeholders.sql
+
+# Non-Docker
+mysql -uroot -ppassword acore_world < \
+  data/sql/world/updates/20260913_remove_legacy_spell_dbc_placeholders.sql
+```
+
+Restart worldserver after applying this repair so it reloads the restored
+client DBC records. Fresh installations using the current talent-data SQL
+do not create the incomplete rows and do not need this repair.
+
+### Character-database migrations
+
+Apply the relevant character migrations when upgrading:
 
 ```bash
 # Docker
@@ -444,6 +591,15 @@ docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
 docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
   modules/mod-llm-chatter/data/sql/characters/updates/20260725_guild_login_greeting.sql
 
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260908_instance_proximity_boss_events.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260914_npc_multidirectional_interactions.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260919_real_general_items.sql
+
 # Non-Docker
 mysql -uroot -ppassword acore_characters < \
   data/sql/characters/updates/20260320_bot_memory_system.sql
@@ -489,6 +645,15 @@ mysql -uroot -ppassword acore_characters < \
 
 mysql -uroot -ppassword acore_characters < \
   data/sql/characters/updates/20260725_guild_login_greeting.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260908_instance_proximity_boss_events.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260914_npc_multidirectional_interactions.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260919_real_general_items.sql
 ```
 
 Migrations are idempotent — safe to run on an already

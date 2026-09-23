@@ -38,6 +38,7 @@ _spice_count = 2
 from chatter_shared import (
     call_llm, cleanup_message, strip_speaker_prefix,
     get_chatter_mode, get_class_name, get_race_name,
+    get_race_faction,
     get_gender_label,
     get_db_connection, build_race_class_context,
     build_race_class_context_parts,
@@ -71,6 +72,11 @@ from chatter_shared import (
     strip_conversation_actions,
     append_conversation_json_instruction,
     select_conversation_message_count,
+    shorten_chat_message,
+    shorten_chat_question,
+    brief_casual_response_fits,
+    bound_brief_casual_response,
+    build_brief_casual_repair_prompt,
 )
 from chatter_db import (
     get_character_info_by_name,
@@ -159,6 +165,20 @@ from chatter_constants import (
     BG_MAP_NAMES,
     RAID_MAP_IDS,
 )
+
+
+def _filter_group_bots_by_player_faction(
+    bots, player_race,
+):
+    player_faction = get_race_faction(player_race)
+    if not player_faction:
+        return []
+    return [
+        bot for bot in bots
+        if get_race_faction(bot.get('faction_race'))
+        == player_faction
+    ]
+
 
 logger = logging.getLogger(__name__)
 
@@ -508,6 +528,27 @@ def _has_recent_join_greeting(
 # ============================================================
 # PROMPT BUILDERS
 # ============================================================
+def _prepare_group_farewell(
+    db, client, config, bot_name, bot_race,
+    bot_class, bot_gender, traits, mode,
+    group_id, bot_guid,
+):
+    """Ensure a leaving message exists for this group session."""
+    try:
+        _generate_farewell(
+            db, client, config,
+            bot_name, bot_race, bot_class,
+            bot_gender, traits, mode,
+            group_id, bot_guid,
+        )
+    except Exception:
+        logger.error(
+            "Farewell generation failed bot=%s",
+            bot_name,
+            exc_info=True,
+        )
+
+
 def process_group_event(db, client, config, event):
     """Handle a bot_group_join event.
 
@@ -614,6 +655,7 @@ def process_group_event(db, client, config, event):
         )
         traits = trait_result['traits']
         stored_tone = trait_result.get('tone')
+        mode = get_chatter_mode(config)
 
         # 1b. Memory: start session + fetch memories
         player_guid = 0
@@ -783,14 +825,19 @@ def process_group_event(db, client, config, event):
                         exc_info=True,
                     )
 
-        # On rejoin, traits and memory are set up
-        # but no greeting messages are generated.
+        # On rejoin, restore or generate the hidden
+        # farewell before skipping visible greetings.
         if is_rejoin:
+            _prepare_group_farewell(
+                db, client, config,
+                bot_name, bot_race, bot_class,
+                bot.get('gender', ''), traits, mode,
+                group_id, bot_guid,
+            )
             _mark_event(db, event_id, 'completed')
             return True
 
         # 2. Build prompt with chat history
-        mode = get_chatter_mode(config)
         history = _get_recent_chat(db, group_id)
         chat_hist = format_chat_history(history)
         members = get_group_members(db, group_id)
@@ -847,8 +894,7 @@ def process_group_event(db, client, config, event):
         if not message:
             _mark_event(db, event_id, 'skipped')
             return False
-        if len(message) > 255:
-            message = message[:252] + "..."
+        message = shorten_chat_message(message)
 
 
         # 5. Insert message for delivery via party
@@ -891,18 +937,12 @@ def process_group_event(db, client, config, event):
             )
 
         # 8. Pre-generate farewell message
-        try:
-            _generate_farewell(
-                db, client, config,
-                bot_name, bot_race, bot_class,
-                bot.get('gender', ''),
-                traits, mode, group_id, bot_guid,
-            )
-        except Exception as e:
-            logger.error(
-                "Farewell generation failed "
-                "bot=%s", bot_name, exc_info=True,
-            )
+        _prepare_group_farewell(
+            db, client, config,
+            bot_name, bot_race, bot_class,
+            bot.get('gender', ''), traits, mode,
+            group_id, bot_guid,
+        )
 
         # 9. Mark event completed
         _mark_event(db, event_id, 'completed')
@@ -1182,8 +1222,15 @@ def process_group_join_batch_event(
                         mc.close()
                         bot_player_known = True
 
-            # On rejoin, skip greeting but track bot
+            # On rejoin, prepare the hidden farewell,
+            # then skip the visible greeting.
             if is_rejoin:
+                _prepare_group_farewell(
+                    db, client, config,
+                    bot_name, bot_race, bot_class,
+                    bot.get('gender', ''),
+                    traits, mode, group_id, bot_guid,
+                )
                 greeted_bots.append(bot)
                 continue
 
@@ -1270,8 +1317,7 @@ def process_group_join_batch_event(
             )
             if not message:
                 continue
-            if len(message) > 255:
-                message = message[:252] + "..."
+            message = shorten_chat_message(message)
 
             # Stagger: 0s, 2s, 4s, 6s ...
             delay = idx * 2
@@ -1306,20 +1352,12 @@ def process_group_join_batch_event(
             }
 
             # 5. Pre-generate farewell
-            try:
-                _generate_farewell(
-                    db, client, config,
-                    bot_name, bot_race, bot_class,
-                    bot.get('gender', ''),
-                    traits, mode,
-                    group_id, bot_guid,
-                )
-            except Exception as e:
-                logger.error(
-                    "Farewell generation failed "
-                    "bot=%s", bot_name,
-                    exc_info=True,
-                )
+            _prepare_group_farewell(
+                db, client, config,
+                bot_name, bot_race, bot_class,
+                bot.get('gender', ''),
+                traits, mode, group_id, bot_guid,
+            )
 
         if not greeted_bots:
             _mark_event(db, event_id, 'skipped')
@@ -1559,8 +1597,7 @@ def _batch_welcome(
     )
     if not msg:
         return
-    if len(msg) > 255:
-        msg = msg[:252] + "..."
+    msg = shorten_chat_message(msg)
 
 
     emote = parsed.get('emote')
@@ -1581,12 +1618,6 @@ def _batch_welcome(
         db, group_id, wb_guid,
         wb_name, True, msg
     )
-
-
-
-
-
-
 
 
 def process_group_player_msg_event(
@@ -1641,16 +1672,28 @@ def process_group_player_msg_event(
     # Get all bots in group for name matching
     cursor = db.cursor(dictionary=True)
     cursor.execute("""
-        SELECT bot_guid, bot_name,
-               trait1, trait2, trait3, tone,
-               travel_mode, travel_context,
-               is_mounted, is_flying,
-               is_taxi_flying, is_on_transport,
-               mount_display_id, transport_name
-        FROM llm_group_bot_traits
-        WHERE group_id = %s
+        SELECT t.bot_guid, t.bot_name,
+               t.trait1, t.trait2, t.trait3, t.tone,
+               t.travel_mode, t.travel_context,
+               t.is_mounted, t.is_flying,
+               t.is_taxi_flying, t.is_on_transport,
+               t.mount_display_id, t.transport_name,
+               c.race AS faction_race
+        FROM llm_group_bot_traits t
+        JOIN characters c ON c.guid = t.bot_guid
+        WHERE t.group_id = %s
     """, (group_id,))
     all_bots = cursor.fetchall()
+
+    cursor.execute(
+        "SELECT race FROM characters WHERE guid = %s",
+        (int(event.get('subject_guid') or 0),),
+    )
+    player_row = cursor.fetchone()
+    all_bots = _filter_group_bots_by_player_faction(
+        all_bots,
+        player_row.get('race') if player_row else None,
+    )
 
     if not all_bots:
         _mark_event(db, event_id, 'skipped')
@@ -1671,6 +1714,9 @@ def process_group_player_msg_event(
     addressed = addr_result.get('bot')
     multi_addressed = addr_result.get(
         'multi_addressed', False
+    )
+    brief_casual = bool(
+        addr_result.get('brief_casual', False)
     )
     if addressed:
         for b in all_bots:
@@ -1789,10 +1835,12 @@ def process_group_player_msg_event(
         )
 
         force_conv = (
-            multi_addressed and num_bots >= 2
+            multi_addressed
+            and num_bots >= 2
         )
         rng_conv = (
             not force_conv
+            and not brief_casual
             and num_bots >= 2
             and eff_conv_chance > 0
             and random.randint(1, 100)
@@ -1835,6 +1883,7 @@ def process_group_player_msg_event(
                         zone_id=zone_id,
                         area_id=area_id,
                         map_id=map_id,
+                        brief_casual=brief_casual,
                     )
                 )
                 if conv_ok:
@@ -1879,7 +1928,11 @@ def process_group_player_msg_event(
         memory_enabled = int(config.get(
             'LLMChatter.Memory.Enable', 1
         ))
-        if memory_enabled and player_info:
+        if (
+            not brief_casual
+            and memory_enabled
+            and player_info
+        ):
             recall_chance = int(config.get(
                 'LLMChatter.Memory'
                 '.IdleRecallChance', 30,
@@ -1915,6 +1968,8 @@ def process_group_player_msg_event(
             stored_tone=stored_tone,
             memories=msg_memories,
             travel_context=travel_context,
+            brief_casual=brief_casual,
+            allow_action=not brief_casual,
         )
 
         max_tokens = pick_random_max_tokens(config)
@@ -1975,14 +2030,46 @@ def process_group_player_msg_event(
         message = cleanup_message(
             message, action=parsed.get('action')
         )
-        if not message:
+        emote = parsed.get('emote')
+        brief_fallback = (message, emote)
+        if (
+            brief_casual
+            and not brief_casual_response_fits(
+                message, emote
+            )
+        ):
+            repair_meta = dict(pmsg_meta)
+            repair_meta['brief_casual_repair'] = True
+            response = call_llm(
+                client,
+                build_brief_casual_repair_prompt(prompt),
+                config,
+                max_tokens_override=max_tokens,
+                context=f"grp-msg-brief-repair:{bot_name}",
+                label=_pmsg_label,
+                metadata=repair_meta,
+            )
+            parsed = parse_single_response(response or '')
+            message = strip_speaker_prefix(
+                parsed.get('message', ''), bot_name
+            )
+            message = cleanup_message(message)
+            emote = parsed.get('emote')
+        if brief_casual:
+            fallback_message, fallback_emote = brief_fallback
+            message, emote = bound_brief_casual_response(
+                message,
+                emote,
+                fallback_message,
+                fallback_emote,
+            )
+        if not message and not (
+            brief_casual and emote
+        ):
             _mark_event(db, event_id, 'skipped')
             return False
-        if len(message) > 255:
-            message = message[:252] + "..."
-
-
-        emote = parsed.get('emote')
+        if message:
+            message = shorten_chat_message(message)
         reply_delay = calculate_dynamic_delay(
             len(message), config,
             prev_message_length=len(
@@ -2003,12 +2090,13 @@ def process_group_player_msg_event(
 
         _store_chat(
             db, group_id, bot_guid,
-            bot_name, True, message
+            bot_name, True,
+            message or f"[performed /{emote}]",
         )
 
         # Second bot chance — MUTUAL EXCLUSION:
         # skip if conversation path was used
-        if not used_conversation:
+        if not used_conversation and not brief_casual:
             second_chance = int(config.get(
                 'LLMChatter.GroupChatter'
                 '.PlayerMsgSecondBotChance',
@@ -2306,8 +2394,7 @@ def _try_second_bot_response(
     )
     if not msg2:
         return
-    if len(msg2) > 255:
-        msg2 = msg2[:252] + "..."
+    msg2 = shorten_chat_message(msg2)
 
 
     emote = parsed.get('emote')
@@ -2415,8 +2502,7 @@ def _welcome_from_existing_bot(
     )
     if not msg:
         return
-    if len(msg) > 255:
-        msg = msg[:252] + "..."
+    msg = shorten_chat_message(msg)
 
 
     # Insert with 5s delay (greeting is at 2s)
@@ -2666,8 +2752,7 @@ def _maybe_comment_on_composition(
     )
     if not msg:
         return
-    if len(msg) > 255:
-        msg = msg[:252] + "..."
+    msg = shorten_chat_message(msg)
 
 
     emote = parsed.get('emote')
@@ -4254,8 +4339,7 @@ def _idle_single_statement(
         )
         if not message:
             return False
-        if len(message) > 255:
-            message = message[:252] + "..."
+        message = shorten_chat_message(message)
 
 
         # Insert directly into messages table
@@ -4584,8 +4668,7 @@ def _idle_conversation(
             )
             if not text:
                 continue
-            if len(text) > 255:
-                text = text[:252] + "..."
+            text = shorten_chat_message(text)
 
             # Find the bot_guid for speaker
             speaker_guid = None
@@ -5047,9 +5130,7 @@ def check_bot_questions(db, client, config):
             ):
                 return False
 
-        if len(message) > 255:
-            # Preserve trailing '?' after truncation
-            message = message[:254] + "?"
+        message = shorten_chat_question(message)
 
         # Deliver the question
         emote = parsed.get('emote')

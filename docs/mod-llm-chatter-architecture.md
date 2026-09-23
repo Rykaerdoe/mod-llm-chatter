@@ -1,6 +1,6 @@
 # mod-llm-chatter Architecture
 
-Last updated: 2026-09-08 (instance proximity chatter)
+Last updated: 2026-09-20 (configurable player-chat prefix filtering)
 
 ## Purpose
 
@@ -101,9 +101,15 @@ NPCs, and real players as they move through the world:
    internal-name-marker exclusions; denylist; boss exclusion;
    guard/interactive role; humanoid; configured non-humanoid allowlist;
    then reject.
-3. One or more speakers are selected from the candidate pool.
-   If all candidates are party bots, the scan is skipped (idle chat
-   handles that case).
+3. One or more speakers are selected from the candidate pool. If all
+   candidates are party bots, the scan is skipped (idle chat handles
+   that case). Directed NPC interactions keep the addressed NPC first
+   and can add zero to two compatible nearby NPCs. A direct interaction
+   with an ungrouped playerbot keeps that bot first when it speaks and uses
+   the same weighted selector to add zero to two compatible NPCs or ungrouped
+   bots. A bot-directed emote can instead produce a witness-only scene with
+   one or two nearby speakers while retaining the silent bot as the addressed
+   subject outside the speaking roster.
 4. A `proximity_say` (single statement) or `proximity_conversation`
    (multi-speaker) event is queued to `llm_chatter_events` with
    NPC spawn GUIDs and nearby entity names in `extra_data`.
@@ -115,16 +121,48 @@ NPCs, and real players as they move through the world:
    `"say"` (for bots) or `"msay"` (for NPCs).
 7. C++ delivery dispatches bot messages via `CHAT_MSG_SAY` and NPC
    messages via `CHAT_MSG_MONSTER_SAY` (speech bubbles). Movement never
-   disqualifies a speaker. Stationary, facing-safe speakers may face each
-   other via `SetFacingToObject()`; moving or pathing speakers talk without
-   rotation. NPC orientation resets via `BasicEvent` only when facing was
-   applied.
-8. When a real player speaks in `/say`, an explicitly named eligible
-   creature wins first, followed by the selected target, then a recent
-   scene or ordinary nearby candidate.
-   `HandleProximityPlayerSay()` in `LLMChatterGroupCombat.cpp`
-   detects the reply and queues a `proximity_reply` event, enabling
-   natural player-to-NPC/bot exchanges.
+   disqualifies a speaker. Only idle or random-wandering NPCs may rotate.
+   A directed line uses its explicit addressee when present; otherwise
+   the conversation sequence supplies the fallback. One facing lease is
+   retained through the final line before the original orientation is
+   restored. Scripted or controlled movement speaks without rotation.
+8. When a real player speaks in `/say`, a selected eligible NPC or same-team
+   ungrouped playerbot is the addressee unless another nearby candidate's
+   name is explicitly marked with a comma or colon as a vocative. Without a
+   selection, an unambiguous full name or unique meaningful token can direct
+   the line anywhere it occurs. Ambiguous title/place tokens are rejected.
+   A different named candidate is preferred as a joining speaker. An
+   ineligible cross-faction named bot falls back only to an already selected
+   eligible NPC or bot; otherwise the direct route is suppressed. A living
+   selected player, party bot, boss, or runtime-ineligible speaking NPC
+   suppresses random fallback; dead and non-speaking targets are ignored.
+   With no direct addressee, recent-scene and ordinary nearby fallback
+   behavior remains available.
+9. A social emote directed at an eligible NPC has its own verbal-reaction
+   chance and cooldown, independent of the separate 80% animation-mirroring
+   roll. SmartAI and
+   configured C++ scripted-emote ownership suppresses generated NPC and
+   mirror reactions so scripted behavior remains authoritative. When a
+   mirror animation is actually scheduled, its emote name is passed to the
+   verbal prompt so generated speech cannot contradict the visible action.
+10. A social emote directed at a same-team playerbot outside the player's
+    group uses the same proximity eligibility boundary. A mapped emote has
+    an independent 80% default mirror chance and the bot has an independent
+    80% default chance to answer in local `/say`. When the bot's verbal roll
+    fails, a separate 50% default witness-scene roll can select one or two
+    compatible nearby NPCs or ungrouped bots to comment while the addressed
+    bot remains silent. Target-speaking scenes may add zero to two joiners.
+    Witness-only scenes retain the addressed bot as structured context but
+    exclude it from the speaking roster, so no line is fabricated for it.
+    One prompt receives the original player action, addressed subject, and
+    full speaking roster, keeping the resulting chain coherent. An accepted
+    direct route suppresses the grouped observer path; rejected targets and
+    unmapped emotes with the verbal route disabled retain the existing
+    external-player observer fallback.
+11. Directed `/say` routing is deterministic after an eligible NPC or
+    same-team ungrouped playerbot is resolved. It does not use a response
+    chance: the addressee is always queued, while only the number of nearby
+    joiners is randomized.
 
 NPCs are identified by spawn GUID (`Creature::GetSpawnId()`) rather
 than entry ID. Cooldowns, scene matching, and history include map and
@@ -140,6 +178,9 @@ excluded across ordinary and boss dialogue. Nearby-name prompt context
 is case-insensitively deduplicated.
 One conversation also cannot select two creatures with the same display
 name because the JSON response contract identifies speakers by name.
+Directed multi-NPC prompts choose either a player-inclusive exchange or
+an NPC aside about the player's real words/action. They never generate
+dialogue or actions for the real player.
 
 Boss dialogue is a separate flow owned by
 `LLMChatterBossDialogue.cpp` and `chatter_boss_dialogue.py`. A boss can
@@ -227,11 +268,19 @@ Player-driven Guild exchanges use a separate, session-owned path:
    lines for that player session. One high-priority
    `guild_player_message` event is queued after a short debounce with
    the live eligible Guild-bot candidates.
-4. `chatter_guild_player.py` selects an addressed bot first when
-   applicable, applies a soft penalty to recent speakers, and rolls
-   between one reply, multiple independent replies, or a genuine
-   multi-bot conversation. A group-directed message raises the
-   independent multi-reply chance without forcing multiple bots.
+4. The shared LLM intent analysis may resolve either an explicit name or
+   an implicit reply to the immediately prior speaker from recent history.
+   If it returns no single target for a non-group turn, the bridge preserves
+   visible turn-taking by selecting the eligible bot directly before the
+   current player line in the stored transcript.
+   It also classifies the conversational scale semantically rather than
+   matching a fixed phrase list. `chatter_guild_player.py` selects that
+   addressed bot first, applies a soft penalty only to other recent-speaker
+   selection, and rolls between one reply, multiple independent replies,
+   or a genuine multi-bot conversation. A brief single-addressee
+   continuation stays with one responder when a reply is warranted; a
+   group-directed message raises the independent multi-reply chance without
+   forcing multiple bots.
 5. Player-reply prompts combine a compact rolling summary with the
    latest 15 visible Guild lines: player messages, player-driven
    replies, ambient statements, and ambient conversation lines.
@@ -242,7 +291,8 @@ Player-driven Guild exchanges use a separate, session-owned path:
 6. Callback, player-name, follow-up-question, and participant-reference
    decisions are bridge-side RNG choices. Prompt validation and
    deterministic name insertion keep those choices enforceable across
-   different configured models.
+   different configured models. Brief casual continuations suppress the
+   callback, name, and follow-up-question rolls.
 7. Summary compaction calls the same `call_llm()` path with the user's
    configured provider and model. It runs only after the unsummarized
    interaction text crosses a configurable threshold.
@@ -278,6 +328,37 @@ that playerbots are ready synchronously:
 9. Native Guild delivery records successful greetings as `reply`
    history, making them visible to later player-session continuity.
 
+### Player-chat input filtering
+
+`LLMChatterConfig` owns the reload-safe, server-side
+`LLMChatter.PlayerChat.IgnoredPrefixes` denylist. Matching is literal,
+case-insensitive for ASCII letters, and ignores leading whitespace. The
+default is empty so existing installations retain their current behavior.
+
+Party, General, Guild, and `/say` capture paths apply this shared filter
+before any history write, cooldown/session mutation, or event queue
+insertion. A matching Guild line also does not cancel a pending login
+greeting. Existing `LANG_ADDON`, hidden-payload, and Playerbot-command
+protections remain separate and continue to run. In particular,
+`SendAddonMessage` protocol prefixes do not belong in this denylist because
+their `LANG_ADDON` traffic is already rejected globally.
+
+### Player-response faction boundary
+
+Playerbot responders to real-player General, Party, Guild, and proximity
+messages must match the initiating player's Alliance/Horde team. Candidate
+collection enforces this in C++, and the bridge rechecks database-backed
+candidate rosters before generation. Delivery performs a final team check for
+General, Party, Guild, and login-greeting events so a stale or malformed queued
+row cannot speak through the wrong faction channel. An unavailable subject is
+not treated as a faction mismatch; only a resolved, differing team is rejected.
+General player cooldown keys and history reads are faction-scoped within the
+zone. Proximity NPC eligibility remains a separate disposition-aware policy;
+the team boundary here applies to playerbots.
+
+General-to-Party relays require the General speaker, the group's real player,
+and every responding party bot to share one faction.
+
 ## Chatter Mode Ownership
 
 `tools/chatter_mode.py` owns the canonical playerbot identity boundary
@@ -286,6 +367,46 @@ World of Warcraft; in `roleplay` mode, they speak as their characters in
 Azeroth. General, Party, Guild, Battleground, Raid, screenshot, emote,
 and playerbot `/say` prompt paths must use that shared contract rather
 than defining independent versions of normal-mode behavior.
+
+Player-responsive Guild, General, party, proximity-speech, and
+proximity-emote prompts share one conversational-scale instruction from
+`chatter_shared.py`. The model must answer brief casual input in kind and
+must not inflate a lightweight message or action into a speech,
+explanation, story, or new topic. This is prompt-level semantic guidance,
+not a language-specific keyword list. For player speech, the shared semantic
+analysis marks a turn as `brief_casual`; that hard mode suppresses incidental
+multi-responder RNG, questions, callbacks, and creative expansion, limits
+generated text to 2-8 words and 50 characters, and permits one
+format-preserving rewrite when the first result exceeds the contract. Guild
+can render a short third-person narrator action because guildmates may be
+remote. General remains textual. Party and proximity speech can instead
+deliver a valid structured emote with an empty message only while
+`brief_casual` is true; C++ skips the blank chat packet and plays only the
+emote. Directed player-emote events request the same short scale and may also
+use emote-only output, but they retain their existing server reaction chance
+and do not receive the semantic optional-reply roll or hard repair gate.
+
+The analysis separately marks `requires_reply`: every question must be true,
+while statements are judged semantically in conversational context. The bridge
+derives `reply_optional` only when the model says a `brief_casual` statement
+does not require a reply. Before generation, Guild, General, proximity-speech,
+and directed boss-speech handlers make one shared configurable RNG roll. A
+failed roll marks the event skipped without calling the generation model; a
+successful optional turn stays single-responder. Party player messages do not
+use this silence gate: once queued, they continue to a concise response even
+when classified as `reply_optional`. If the strict repair
+still overruns, Party uses the shared deterministic bound for each selected
+speaker instead of dropping the statement or conversation. A casual
+multi-addressee classification therefore retains the forced conversation path
+and every selected responder. Questions, requests, instructions, warnings,
+important information, and other turns that clearly expect engagement are not
+optional. This remains semantic and contextual, with no phrase, punctuation,
+or keyword list.
+
+Emote-only delivery resolves the emote name before consuming the row. Invalid
+names receive a terminal `invalid_emote` drop instead of a retry, and party
+rows delivered inside battlegrounds reuse `IsBGAllowedEmote()` before playing
+the animation.
 
 Actual NPCs do not follow `LLMChatter.ChatterMode`. Proximity payloads
 already identify them with `is_npc`; `chatter_proximity.py` therefore
@@ -318,11 +439,25 @@ It carries two extra attributes:
      sampling temperature is sent through `extra_body` for Anthropic
      SDK v1 compatibility
    - **OpenAI / Google / OpenRouter / Ollama**: system role message +
-     user role message
+     user role message; `llm_compat.py` selects the token field and
+     optional parameters from a conservative model capability profile
+   - **Modern OpenAI reasoning models**: use
+     `max_completion_tokens`, coordinate temperature with reasoning
+     effort, and apply `LLMChatter.OpenAI.ReasoningEffort` only when
+     compatible; `_effective_max_tokens()` applies the OpenAI multiplier
+     whenever hidden reasoning may consume the output budget
+   - **New or unrecognized models**: start with safe parameters; an
+     explicit provider rejection can remove `temperature` or
+     `reasoning_effort`, or switch the token-limit field, retry the
+     rejected call, and cache that correction for the process lifetime
    - **OpenRouter reasoning**: `_apply_openrouter_options()` adds the
      opt-in `reasoning` object to normal and quick-analysis requests;
      `_effective_max_tokens()` applies its multiplier only while an
      effort other than `none` is enabled
+   - **Ollama**: context size is owned by the Ollama server because its
+     OpenAI-compatible endpoint has no per-request context parameter;
+     disabling thinking sends `reasoning_effort = none` and retains the
+     `/no_think` prompt fallback
 4. If a plain string is passed instead of `PromptParts`, the entire
    string is sent as a single user message (backward compatibility).
 
@@ -355,20 +490,25 @@ the LLM is even asked for an emote.
 The module currently uses three separate DB-backed queues. They do not
 share one global scheduler.
 
-### 1) `llm_chatter_queue` - legacy ambient request queue
+### 1) `llm_chatter_queue` - ambient request queue
 
-- used for legacy ambient General chatter requests
-- inserted by C++ in `LLMChatterWorld.cpp`
+- used for ambient General chatter requests
+- inserted by C++ in `LLMChatterAmbient.cpp`
 - consumed by `process_pending_requests()` in
   `llm_chatter_bridge.py`
 - fetched FIFO: `ORDER BY created_at ASC`
 - gated by `LLMChatter.MaxPendingRequests`, which currently limits only
   this queue, not the event queue
+- C++ stores the selected `message_type`; Python does not reroll it
+- `item_context` is populated only for trade requests and contains a
+  value-only snapshot of an eligible item in the first speaker's live
+  inventory
 
 ### 2) `llm_chatter_events` - reactive/event queue
 
-- used for `bot_group_*`, `bg_*`, `player_general_msg`, weather,
-  transport, holiday, and related event-driven work
+- used for `bot_group_*`, `bg_*`, `player_general_msg`, real
+  `bot_loot_item`, weather, transport, holiday, and related event-driven
+  work
 - rows carry `priority`, `react_after`, and `expires_at`
 - fetched by the bridge only when:
   - `status = 'pending'`
@@ -389,6 +529,10 @@ share one global scheduler.
 - ambient rows with `event_id = NULL` therefore remain lowest priority
 - when the delivery-order feature is disabled, fallback order remains
   `deliver_at ASC`
+- `delivered = 1` means the row was consumed, not necessarily spoken;
+  `drop_reason IS NULL` distinguishes successful delivery from a drop
+- directed rows carry optional player, bot, or NPC addressee IDs used for
+  facing; dropping one directed line cancels its remaining queued lines
 
 ### Timing layers
 
@@ -406,6 +550,9 @@ There are two separate timing stages:
 stage for most Python-generated messages. Player-directed replies use
 `responsive=True`; ambient/group conversations can also include reading
 time from the previous message length.
+Player-triggered proximity say, active-scene reply, conversation, and emote
+events use the high priority tier (0-2 second reaction delay by default) and
+a short expiry, while ambient proximity events remain lower priority.
 
 ### General-Channel Pacing Gate
 
@@ -435,6 +582,11 @@ Party-channel messages use a DB-backed pacing table,
   pre-cached instant reactions and farewell packets, call
   `RecordPartyChatGateActivity()` after sending. They are not delayed,
   but they still make later filler chatter back off.
+- Normal join handling pre-generates each bot's farewell after its greeting.
+  A player-session rejoin deliberately skips another visible greeting, but
+  still restores a persistent farewell or generates a missing one before the
+  join event completes. `OnRemoveMember` can therefore send the stored line
+  synchronously before deleting the session trait row.
 - Policy names are `urgent`, `responsive`, `contextual`, `filler`, and
   `bypass`. Combat/state/BG/raid-critical feedback remains immediate;
   idle-style filler can defer before spending LLM tokens.
@@ -547,6 +699,8 @@ Session 69 added two scheduling controls around that model:
 | `src/LLMChatterDelivery.h` | 4 | Narrow delivery extraction declaration used by `LLMChatterWorld.cpp` |
 | `src/LLMChatterAmbient.cpp` | 963 | Ambient world/event ownership: day/night transitions, holiday start/stop routing, weather state tracking, weather reactions, zone-level ambient chatter selection, ambient request queue writes |
 | `src/LLMChatterAmbient.h` | 24 | Narrow ambient declarations consumed by `LLMChatterWorld.cpp` |
+| `src/LLMChatterLoot.cpp/.h` | Real ungrouped-playerbot loot capture, per-source reservoir sampling, bounded aggregation, audience/cooldown revalidation, and event queueing |
+| `src/LLMChatterTrade.cpp/.h` | Demand-driven quality-weighted selection and value snapshots of tradeable items from the selected ambient seller's live inventory |
 | `src/LLMChatterNearby.cpp` | 691 | Nearby-object and nearby-creature scanning, POI scoring, nearby direct event queueing, nearby-local cooldowns |
 | `src/LLMChatterNearby.h` | 6 | Narrow nearby scan declaration consumed by `LLMChatterWorld.cpp` |
 | `src/LLMChatterWorld.cpp` | ~1000 | WorldScript ownership, thin ambient/nearby/delivery/proximity/boss delegation, transport polling and route announcements, transport-private state, retained world-private `QueueEvent()` helper |
@@ -556,13 +710,13 @@ Session 69 added two scheduling controls around that model:
 | `src/LLMChatterGroupCombat.cpp` | ~2550 | Remaining group PlayerScript implementation bodies (kill/death/loot/combat/chat/level/quest/achievement/spell/resurrect/corpse-run/dungeon-entry/emote dispatch), text-emote target classification and group gating, zone transition handling, combat state callouts, `MBOT` debug-log suppression, file-local `QueueStateCallout()` |
 | `src/LLMChatterGroupInternal.h` | ~235 | Shared group internal structs, cooldown/batch/mutex declarations, helper declarations, domain entry points, and `EmoteTargetType` |
 | `src/LLMChatterGroupJoin.cpp` | 877 | Group join batching: `QueueBotGreetingEvent()`, `EnsureGroupJoinQueued()`, `FlushGroupJoinBatches()`, `LLMChatterGroupScript` (GroupScript: `OnAddMember`, `OnRemoveMember` with farewell, `OnDisband`) |
-| `src/LLMChatterGroupEmote.cpp` | 534 | Emote reaction system: `DelayedMirrorEmoteEvent`, `DelayedCreatureMirrorEmoteEvent`, emote static data (mirror map, denylist, combat callouts, contagious set), `HandleEmoteAtGroupBot()`, `HandleEmoteAtCreature()`, `HandleEmoteObserver()`, `EvictEmoteCooldowns()` |
+| `src/LLMChatterGroupEmote.cpp` | 780 | Emote reaction system: delayed bot/creature mirror events, emote static data, grouped and ungrouped playerbot mirroring, creature mirroring, observer reactions, and cooldown eviction |
 | `src/LLMChatterGroupQuest.cpp` | 530 | Quest accept batching: `FlushQuestAcceptBatches()`, `LLMChatterCreatureScript` (AllCreatureScript: `CanCreatureQuestAccept` with debounce/immediate paths) |
 | `src/LLMChatterGroup.h` | 18 | World-to-group cross-call surface plus group registration |
 | `src/LLMChatterPlayer.cpp` | 1105 | Player General-channel hooks, General cooldowns, subzone cooldowns, `EnsureBotInGeneralChannel()`, player registration |
 | `src/LLMChatterRaid.cpp` | 767 | Raid boss hooks (pull/kill/wipe), boss lookup table (80+ entries across Classic/TBC/WotLK), `IsDatabaseBound() override`, raid registration |
-| `src/LLMChatterProximity.cpp` | ~1700 | Ordinary outdoor/instance proximity scans, global curated NPC/playerbot eligibility and compatibility, authoritative selected/named `/say` routing, map/instance-aware scenes and cooldowns, and event payload construction |
-| `src/LLMChatterProximity.h` | ~20 | Proximity scan and player-say hook declarations consumed by `LLMChatterWorld.cpp` and `LLMChatterGroupCombat.cpp` |
+| `src/LLMChatterProximity.cpp` | 2674 | Ordinary outdoor/instance proximity scans, curated NPC/playerbot eligibility and compatibility, selected/named `/say` routing, mixed bot-directed reaction chains, map/instance-aware scenes and cooldowns, and event payload construction |
+| `src/LLMChatterProximity.h` | 39 | Proximity scan and player-say hook declarations consumed by `LLMChatterWorld.cpp` and `LLMChatterGroupCombat.cpp` |
 | `src/LLMChatterBossDialogue.cpp/.h` | ~850 | Separate boss-only pre-aggro scanning, safe-band eligibility, selected/named `/say` routing, denylist, and boss-instance presence scheduling |
 | `src/LLMChatterBG.cpp` | 1348 | Battleground hooks, BG state polling, BG queue helpers, BG registration |
 | `src/LLMChatterBG.h` | 14 | BG registration declaration |
@@ -582,6 +736,7 @@ Session 69 added two scheduling controls around that model:
 - `AddLLMChatterGuildScripts()`
 - `AddLLMChatterGroupScripts()`
 - `AddLLMChatterPlayerScripts()`
+- `AddLLMChatterLootScripts()`
 - `AddLLMChatterBGScripts()`
 - `AddLLMChatterRaidScripts()`
 - `AddLLMChatterCommandScripts()`
@@ -606,6 +761,7 @@ This asymmetry is known and acceptable in the shipped source state.
 | `tools/llm_chatter_bridge.py` | Main loops, event claiming, registry-driven routing, worker orchestration |
 | `tools/chatter_event_registry.py` | Central Python event registry: handler module/function resolution, producer notes, payload field docs, dead-event tracking |
 | `tools/chatter_ambient.py` | Ambient statement/conversation generation |
+| `tools/chatter_loot.py` | Real `bot_loot_item` validation, exact-looter resolution, prompt generation, and General delivery |
 | `tools/chatter_guild.py` | Guild prompts and insert orchestration |
 | `tools/chatter_guild_player.py` | Player-driven Guild replies, reply topology, session-context prompts, and rolling summary compaction |
 | `tools/chatter_guild_login.py` | Real-player login greetings, responder selection, short-message prompts, and greeting pacing |
@@ -626,9 +782,10 @@ This asymmetry is known and acceptable in the shipped source state.
 | File | Primary ownership |
 |---|---|
 | `tools/chatter_shared.py` | Shared prompt, parse, count, and delay helpers |
+| `tools/llm_compat.py` | Declarative OpenAI-compatible model capability profiles plus narrowly scoped parameter-rejection recovery and process-local learned overrides |
 | `tools/chatter_mode.py` | Canonical normal/RP playerbot identity and channel voice rules, plus mode-invariant NPC guidance |
-| `tools/chatter_text.py` | Parsing, sanitization, anti-repetition |
-| `tools/chatter_llm.py` | Provider/model calls for Anthropic, OpenAI, Google Gemini, OpenRouter, and Ollama; `get_llm_client()` shared client factory; `_split_prompt()`, `_build_chat_messages()`, `_ollama_user_msg()`, `_apply_google_options()`, `_apply_openrouter_options()`, `_openrouter_headers()` for system/user prompt separation and provider tuning; `label=` param logs every call via `chatter_request_logger` |
+| `tools/chatter_text.py` | Parsing, sanitization, anti-repetition, and chat length limiting. Never slice LLM chat output by hand; use `shorten_chat_message()` or `shorten_chat_question()` from this file. |
+| `tools/chatter_llm.py` | Provider/model calls for Anthropic, OpenAI, Google Gemini, OpenRouter, and Ollama; `get_llm_client()` shared client factory; `_split_prompt()`, `_build_chat_messages()`, `_ollama_user_msg()`, `_apply_google_options()`, `_apply_openrouter_options()`, `_openrouter_headers()` for system/user prompt separation and provider tuning; delegates cross-model parameter selection to `llm_compat.py`; `label=` param logs every call via `chatter_request_logger` |
 | `tools/chatter_db.py` | DB access, inserts, zone/cache queries, `any_real_players_online()`, stale-group cleanup, and global group/Guild session cleanup |
 | `tools/chatter_links.py` | WoW link parsing and prompt-side link enrichment for player messages |
 | `tools/chatter_prompts.py` | Ambient/event prompt builders |
@@ -740,7 +897,35 @@ system.
 - day/night processing
 - weather state and transitions
 - ambient zone discovery and faction selection
+- ambient message-family selection
+- demand-driven live inventory snapshots when the selected family is
+  trade
 - ambient chatter request queue writes
+
+### Real General loot ownership
+
+`LLMChatterLoot.cpp` owns `OnPlayerLootItem` capture for ungrouped
+playerbots. The map-thread hook performs player-local checks, consults a
+read-only `(map, zone) -> faction mask` audience snapshot and the in-memory
+cooldown cache, rolls once per loot source, and keeps only an active source
+plus one completed source per bot. It never queries the database or reads
+`RandomPlayerbotMgr` state. A reservoir sample chooses one item uniformly
+when a source yields multiple callbacks. Because a stacked item can already
+have been freed by the callback, `Item::IsInWorld()` is checked before any
+template or entry access. The world-thread flush restricts delivery to
+random bots and revalidates the bot, audience, General membership, and
+persisted zone cooldown before queueing `bot_loot_item`.
+
+The main world script rebuilds the audience snapshot independently of the
+General-channel toggle and publishes it through a `shared_mutex`-protected
+immutable `shared_ptr`; map workers never walk the live session map or
+mutate channel membership. Python handling belongs to
+`tools/chatter_loot.py` and resolves only the event's `subject_guid`.
+There is no persistent loot listener queue beyond the bounded aggregation
+slots and no inventory cache: trade ownership is sampled only after an
+ambient request has selected trade. Trade selection uses a weighted
+reservoir over eligible live bag slots. Common items remain eligible while
+each quality tier above common receives the configured additional weight.
 
 ### Nearby ownership
 
@@ -758,10 +943,34 @@ system.
 - periodic ordinary proximity scans around alive real players
 - outdoor, dungeon, and raid map policy (BGs/arenas excluded)
 - humanoid NPC eligibility, disposition, rank, LOS, and delivery policy
-- bot eligibility filtering (party bots only, all-bot guard rail)
+- bot eligibility filtering (party bots for ordinary scans, explicitly
+  targeted same-team ungrouped bots for directed `/say` and emotes,
+  all-bot guard rail)
 - mutually compatible candidate selection and ordinary event queueing
 - map/instance-scoped `ProximityScene`, history, and cooldown state
 - selected/named player `/say` routing before scene fallback
+- directed social-emote verbal events and synchronized per-player/NPC or
+  per-player/ungrouped-bot cooldowns
+- mounted real players and mounted playerbots remain eligible for directed
+  `/say`, emotes, and active-scene replies; mounting still suppresses
+  automatic and untargeted new-scene selection, and an untargeted `/say`
+  speaker that mounts after queueing is rejected again at delivery
+- policy-scoped weighted selection with one universal two-joiner cap:
+  zero to two NPC joiners for NPC-directed scenes, or zero to two compatible
+  NPC/ungrouped-bot joiners when an ungrouped bot is addressed
+- in-memory-only ordinary cooldown filtering for mixed-scope joiners; the
+  addressed `/say` target is not throttled and no per-candidate persisted
+  cooldown query runs inside the hook
+- strict full-name/unique-token resolution and vocative detection
+
+`LLMChatterGroupEmote.cpp` owns animation mirroring for grouped bots,
+ungrouped bots, and creatures. It also owns the mirror-map availability
+check and loads the SmartAI/configured C++ scripted-emote exclusions used by
+the direct creature mirror and verbal-reaction paths. Delayed bot mirrors
+share one execution-time safety check: the bot must remain out of combat and
+the player must remain present, on the same map, and within the configured
+player-say radius (with a one-yard minimum). This applies to grouped and
+ungrouped bots; grouped verbal reactions are not range-gated by this check.
 
 `LLMChatterBossDialogue.cpp` owns the distinct hostile-boss path:
 
@@ -840,6 +1049,8 @@ reaction probabilities.
   and emote dispatch
 - text-emote target classification and the decision of which paths still
   require group/bot context
+- direct acceptance for ungrouped playerbot targets and external-player
+  observer fallback when no direct route applies
 - `HandleGroupPlayerUpdateZone()`
 - `CheckGroupCombatState()`
 - file-local `QueueStateCallout()`
@@ -869,6 +1080,8 @@ Ownership boundary:
   cooldowns, and observer event queueing
 - creature mirror emotes can fire even when the player is solo;
   observer chatter still requires eligible grouped bots
+- emote cooldown maps are mutex-protected because text-emote hooks can run
+  concurrently on map worker threads
 
 `LLMChatterGroupQuest.cpp` owns:
 
@@ -1022,6 +1235,7 @@ source:
 | Main polling loops, event claim logic, worker behavior | `tools/llm_chatter_bridge.py` |
 | Python event registry / handler resolution metadata | `tools/chatter_event_registry.py` |
 | Ambient statement/conversation runtime logic | `tools/chatter_ambient.py` |
+| Real General loot event handling | `tools/chatter_loot.py` |
 | Group join/player-msg/idle behavior | `tools/chatter_group.py` |
 | Group reaction runtime behavior | `tools/chatter_group_handlers.py` |
 | Shared group-handler pipeline behavior | `tools/chatter_handler_pipeline.py` |
@@ -1048,6 +1262,8 @@ source:
 | C++ shared helper contracts | `src/LLMChatterShared.cpp`, `src/LLMChatterShared.h` |
 | C++ delivery logic | `src/LLMChatterDelivery.cpp`, `src/LLMChatterDelivery.h` |
 | C++ ambient world/event logic | `src/LLMChatterAmbient.cpp`, `src/LLMChatterAmbient.h` |
+| C++ real General loot capture | `src/LLMChatterLoot.cpp`, `src/LLMChatterLoot.h` |
+| C++ ambient trade inventory snapshots | `src/LLMChatterTrade.cpp`, `src/LLMChatterTrade.h` |
 | C++ nearby scan logic | `src/LLMChatterNearby.cpp`, `src/LLMChatterNearby.h` |
 | C++ world transport/dispatcher logic | `src/LLMChatterWorld.cpp` |
 | C++ group batching/combat/state logic | `src/LLMChatterGroup.cpp`, `src/LLMChatterGroupCombat.cpp`, `src/LLMChatterGroupJoin.cpp`, `src/LLMChatterGroupEmote.cpp`, `src/LLMChatterGroupQuest.cpp`, `src/LLMChatterGroup.h`, `src/LLMChatterGroupInternal.h` |
@@ -1123,8 +1339,8 @@ This reduces duplicate near-identical lines across party and raid.
 
 | Table | Producer | Consumer | Notes |
 |---|---|---|---|
-| `llm_chatter_events` | C++ / screenshot agent | Python | Event queue |
-| `llm_chatter_queue` | C++ | Python | Ambient statement/conversation queue |
+| `llm_chatter_events` | C++ / screenshot agent | Python | Event queue, including value-only real-loot payloads |
+| `llm_chatter_queue` | C++ | Python | Ambient statement/conversation queue; C++-selected type and optional trade item snapshot |
 | `llm_chatter_messages` | Python | C++ | Outbound message delivery queue |
 | `llm_group_cached_responses` | Python | C++ | Instant reaction pre-cache |
 | `llm_group_bot_traits` | Python + C++ travel refresh | Python | Group traits/state, location, and live travel context |
