@@ -63,6 +63,7 @@ from chatter_proximity import (  # noqa: E402
     _fetch_proximity_history,
     _player_emote_conversation_prompt,
     _player_emote_single_prompt,
+    _prepare_emote_context,
     _player_say_conversation_prompt,
     _player_say_single_prompt,
     _single_prompt,
@@ -235,8 +236,8 @@ def test_all_proximity_prompt_shapes_receive_instance_context():
         assert 'haunted fortress' in prompt.lower()
 
 
-def test_player_responsive_proximity_prompts_match_input_scale():
-    scale_rule = "Match the player's conversational scale."
+def test_player_responsive_proximity_prompts_carry_purpose_scale_guidance():
+    scale_rule = "not how many words it contains"
     participants = [NPC, {**NPC, 'name': 'Thar'}]
     prompts = [
         _single_prompt(
@@ -273,6 +274,7 @@ def test_player_responsive_proximity_prompts_match_input_scale():
     ]
     for prompt in prompts:
         assert scale_rule in prompt
+        assert "exchange, or closure usually needs only a few natural words" in prompt
 
 
 def test_emote_only_proximity_contract_is_safe():
@@ -575,6 +577,65 @@ def test_silent_addressed_bot_emote_prompt_uses_witnesses():
     assert 'Aliss remains silent and is not in the speaker roster' in prompt
     assert 'listed speakers witnessed the gesture' in prompt
     assert 'Aliss is also scheduled to perform /blush' in prompt
+
+
+def test_custom_emote_at_ungrouped_bot_keeps_typed_action():
+    action = 'slowly sheathes her sword'
+    extra = {
+        **INSTANCE_EXTRA,
+        'custom_emote': 1,
+        'player_emote_id': 0,
+    }
+    _prepare_emote_context(extra, action)
+    assert extra['emote_category'] == 'custom'
+
+    single = _player_emote_single_prompt(
+        _DB(), extra, BOT, action, NORMAL_CONFIG,
+    ).user_prompt
+    assert f'did this directly at Aliss: "{action}"' in single
+    assert '/wave' not in single
+    assert f'/{action}' not in single
+
+    participants = [BOT, NPC]
+    conversation = _player_emote_conversation_prompt(
+        _DB(),
+        {
+            **extra,
+            'participants': participants,
+            'addressed_name': BOT['name'],
+            'interaction_mode': 'player_inclusive',
+        },
+        participants, action, NORMAL_CONFIG,
+    ).user_prompt
+    assert f'did this directly at Aliss: "{action}"' in conversation
+    assert '/wave' not in conversation
+
+    spec = EVENT_REGISTRY['proximity_player_emote']
+    assert spec.payload_fields['custom_emote'] == (int, False)
+
+    proximity = (
+        MODULE_DIR / 'src' / 'LLMChatterProximity.cpp'
+    ).read_text(encoding='utf-8')
+    assert (
+        'isCustom ? customText : GetTextEmoteName(textEmote)'
+        in proximity
+    )
+    assert '",\\"custom_emote\\":"' in proximity
+
+    combat = (
+        MODULE_DIR / 'src' / 'LLMChatterGroupCombat.cpp'
+    ).read_text(encoding='utf-8')
+    assert 'textEmote, mirrorEmote, customText);' in combat
+
+
+def test_named_emote_prompt_wording_is_unchanged():
+    extra = {**INSTANCE_EXTRA, 'player_emote_id': 0}
+    _prepare_emote_context(extra, 'wave')
+    assert extra['emote_category'] != 'custom'
+    prompt = _player_emote_single_prompt(
+        _DB(), extra, BOT, 'wave', NORMAL_CONFIG,
+    ).user_prompt
+    assert 'performed /wave directly at Aliss' in prompt
 
 
 def test_grouped_emote_prompt_tracks_only_scheduled_mirror():
@@ -1074,7 +1135,10 @@ def test_message_insert_addressee_parameters_match_placeholders():
         addressee_npc_spawn_id=102,
     )
     query, params = db.cursor_value.queries[0]
-    assert query.count('%s') == len(params) == 18
+    # 19, not 18: insert_chat_message also binds the `action`
+    # column (added on this branch for Actions Are Real
+    # Emotes) ahead of the three addressee_* columns below.
+    assert query.count('%s') == len(params) == 19
     assert params[-3:] == (None, None, 102)
 
 
@@ -1457,9 +1521,13 @@ def test_cpp_source_contracts_cover_instance_safety():
         'void CheckProximityChatter(bool instanceMaps)', 1
     )[1].split('void HandleProximityPlayerSay(', 1)[0]
     assert 'playerInInstance != instanceMaps' in scoped_scan
+    # ComputeEffectiveChance() picks the instance/outdoor
+    # chance and delegates the scan-interval fatigue window to
+    # ComputeFatiguedChance(), defined just above it.
     effective_chance = source.split(
-        'uint32 ComputeEffectiveChance(', 1
+        'uint32 ComputeFatiguedChance(', 1
     )[1].split('void NoteZoneTrigger(', 1)[0]
+    assert 'ComputeFatiguedChance(player, chance)' in effective_chance
     assert '_proxChatterInstanceChance' in effective_chance
     assert '_proxChatterOutdoorChance' in effective_chance
     assert '_proxChatterInstanceScanInterval' in effective_chance
@@ -1527,8 +1595,7 @@ def test_cpp_source_contracts_cover_instance_safety():
     enter_combat = group_combat.split(
         'void HandleGroupPlayerEnterCombatImpl(', 1
     )[1].split('\nvoid ', 1)[0]
-    assert 'IsLLMChatterBoss(creature)' not in enter_combat
-    assert 'CREATURE_TYPE_FLAG_BOSS_MOB' in enter_combat
+    assert 'IsLLMChatterBoss(creature)' in enter_combat
     assert '_lastBossDialogueCheckTime' in world
     assert 'CheckBossProximityDialogue();' in world
     assert '_lastOutdoorProximityScanTime' in world
@@ -1584,9 +1651,14 @@ def test_mounted_actors_remain_eligible_for_direct_interactions():
     directed_emote = source.split(
         'void HandleProximityPlayerEmote(', 1
     )[1].split('void RecordDeliveredProximityLine(', 1)[0]
+    # IsEligibleProximityBot() adds the team check on top of
+    # IsEligibleProximityBotAnyTeam(), defined just above it.
     bot_eligibility = source.split(
-        'bool IsEligibleProximityBot(', 1
+        'bool IsEligibleProximityBotAnyTeam(', 1
     )[1].split('bool IsEligibleProximityNPC(', 1)[0]
+    assert 'player->GetTeamId() != bot->GetTeamId()' in (
+        bot_eligibility
+    )
     directed_bot = source.split(
         'bool IsProximityDirectedPlayerbotEligible(', 1
     )[1].split(
